@@ -722,6 +722,13 @@ describe('streams routes', () => {
       expect(res.status).toBe(400);
     });
 
+    it('rejects omitted depositAmount (same as explicit zero)', async () => {
+      const { depositAmount: _, ...bodyWithoutDeposit } = validBody;
+      const res = await post(bodyWithoutDeposit, uniqueKey());
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
     it('rejects numeric depositAmount (must be string)', async () => {
       const res = await post({ ...validBody, depositAmount: 1000 }, uniqueKey());
       expect(res.status).toBe(400);

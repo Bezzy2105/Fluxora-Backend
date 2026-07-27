@@ -546,3 +546,8 @@ privacyRouter.delete(
     }
   },
 );
+// The DELETE exemption from the router's GET/HEAD-only convention is scoped to
+// exactly this route+method pair. Any other method on /erasure/:recipientAddress
+// gets a 405, and a future route added under /erasure/* must register its own
+// method restriction rather than silently inheriting an exemption.
+privacyRouter.all('/erasure/:recipientAddress', rejectUnsupportedMethods(['DELETE']));
