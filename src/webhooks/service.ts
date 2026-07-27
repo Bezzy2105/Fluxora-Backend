@@ -37,7 +37,8 @@ import type {
   CircuitBreakerPolicy,
 } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';
-import type { WebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import type { IWebhookRateLimiter, RateLimitConfig } from '../redis/webhookRateLimit.js';
+import { TokenBucketRateLimiter } from './rate-limiter.js';
 import { DEFAULT_WEBHOOK_RETRY_RPS } from '../redis/webhookRateLimit.js';
 
 interface OutboxRow {
@@ -66,7 +67,7 @@ export interface WebhookDispatcherOptions {
   pool?: DbPool;
   policy?: EnhancedRetryPolicy;
   circuitBreakerStore?: WebhookCircuitBreakerStore;
-  rateLimiter?: WebhookRateLimiter;
+  rateLimiter?: IWebhookRateLimiter;
   rateLimitConfig?: RateLimitConfig;
 }
 
@@ -691,7 +692,7 @@ export class WebhookDispatcher {
   private readonly policy: EnhancedRetryPolicy;
   private readonly service: WebhookService;
   private readonly circuitBreakerStore: WebhookCircuitBreakerStore;
-  private readonly rateLimiter?: WebhookRateLimiter;
+  private readonly rateLimiter?: IWebhookRateLimiter;
   private readonly rateLimitConfig: RateLimitConfig;
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
@@ -713,10 +714,11 @@ export class WebhookDispatcher {
     this.pool = options.pool ?? (getPool() as unknown as DbPool);
     this.policy = resolveWebhookRetryPolicy(options.policy);
     this.circuitBreakerStore = options.circuitBreakerStore ?? getWebhookCircuitBreakerStore();
-    this.rateLimiter = options.rateLimiter;
+    this.rateLimiter = options.rateLimiter ?? new TokenBucketRateLimiter();
     this.rateLimitConfig = options.rateLimitConfig ?? {
       limit: parsePositiveInteger(process.env.WEBHOOK_RETRY_RPS, DEFAULT_WEBHOOK_RETRY_RPS),
       windowMs: 1000,
+      burst: parseNonNegativeInteger(process.env.WEBHOOK_RETRY_BURST, 0),
     };
     this.service = new WebhookService(this.policy, this.circuitBreakerStore);
   }
