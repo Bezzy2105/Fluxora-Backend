@@ -145,6 +145,21 @@ describe('backupDatabase', () => {
     expect(result.success).toBe(true)
   })
 
+  it('trims surrounding whitespace from DATABASE_URL and outputPath before invoking pg_dump', async () => {
+    mockExecFileSuccess()
+
+    const result = await backupDatabase(`  ${VALID_URL}  `, `  ${LOCAL_PATH}  `)
+
+    expect(result.success).toBe(true)
+
+    const mock = childProcess.execFile as unknown as MockInstance
+    expect(mock).toHaveBeenCalledOnce()
+
+    const [, args] = mock.mock.calls[0] as [string, string[]]
+    expect(args).toContain(VALID_URL)
+    expect(args).toContain(`--file=${LOCAL_PATH}`)
+  })
+
   it('fails when outputPath is empty in local mode', async () => {
     const result = await backupDatabase(VALID_URL, '')
     expect(result.success).toBe(false)
@@ -313,6 +328,21 @@ describe('restoreDatabase', () => {
     expect(args).toContain('--no-owner')
     // URL passed via --dbname=<url>, never as a bare shell string
     expect(args.some((a: string) => a.startsWith('--dbname='))).toBe(true)
+    expect(args).toContain(LOCAL_PATH)
+  })
+
+  it('trims surrounding whitespace from DATABASE_URL and inputPath before invoking pg_restore', async () => {
+    mockExecFileSuccess()
+
+    const result = await restoreDatabase(`  ${VALID_URL}  `, `  ${LOCAL_PATH}  `)
+
+    expect(result.success).toBe(true)
+
+    const mock = childProcess.execFile as unknown as MockInstance
+    expect(mock).toHaveBeenCalledOnce()
+
+    const [, args] = mock.mock.calls[0] as [string, string[]]
+    expect(args).toContain(`--dbname=${VALID_URL}`)
     expect(args).toContain(LOCAL_PATH)
   })
 
