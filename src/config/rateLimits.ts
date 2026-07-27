@@ -55,6 +55,15 @@ export const ROUTE_BUDGETS: RouteBudget[] = [
     path: '/api/streams/:id',
     config: { baseLimit: 30, writeLimit: 5, exempt: false }
   },
+  // Privacy endpoints - strict limits for sensitive operations
+  {
+    path: '/api/privacy/consent',
+    config: { baseLimit: 10, writeLimit: 10, exempt: false }
+  },
+  {
+    path: '/api/privacy/erasure/:recipientAddress',
+    config: { baseLimit: 5, writeLimit: 5, exempt: false }
+  },
   // Admin endpoints - different limits
   {
     path: '/api/admin',
