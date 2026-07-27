@@ -38,6 +38,7 @@ import {
 import { successResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { recordAuditEventToDb, recordErasureAuditLog } from '../lib/auditLog.js';
+import { hashStringSHA256 } from '../lib/security.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
 
@@ -441,7 +442,7 @@ privacyRouter.delete(
     const pool = getPool();
     const requesterUser = (req as any).user;
     const requesterRole = requesterUser?.role ?? 'admin';
-    const requestedBy = requesterUser?.address ?? (req.headers.authorization ?? '').substring(0, 16) + '…';
+    const requestedBy = requesterUser?.address ?? (req.headers.authorization ? hashStringSHA256(req.headers.authorization) : '');
 
     try {
       let rowsErased = 0;
