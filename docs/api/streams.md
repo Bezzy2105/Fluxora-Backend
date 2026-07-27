@@ -109,6 +109,52 @@ Streams listing uses **cursor-based pagination** (keyset pagination), which is m
 
 **Important:** Cursors are opaque and may change between versions. Do not attempt to parse them; treat them as black-box tokens.
 
+### Pagination Validation Contract
+
+All query parameters are validated via Zod (`PaginationSchema`) **before** any database call is made. Invalid parameters return `400 VALIDATION_ERROR` with a descriptive message.
+
+| Parameter | Type | Validation Rules | Default | Error on Violation |
+| :--- | :--- | :--- | :--- | :--- |
+| `limit` | string → integer | Must be a positive integer string. Parsed to int, clamped to `[1, 100]`. | `50` | `400 VALIDATION_ERROR` |
+| `cursor` | string | Must be a non-empty string. Decoded from base64url; must be valid JSON with `{v: 1, lastId: string}` shape. | `undefined` (first page) | `400 VALIDATION_ERROR` |
+| `status` | string | Passed as-is to the DB filter. No enum validation at the route level. | `undefined` (no filter) | N/A |
+| `sender` | string | Passed as-is to the DB filter. | `undefined` (no filter) | N/A |
+| `recipient` | string | Passed as-is to the DB filter. | `undefined` (no filter) | N/A |
+| `include_total` | string | Must be `"true"` or `"false"` (exact string match). | `false` | `400 VALIDATION_ERROR` |
+
+#### Cursor structure
+
+Cursors are opaque base64url tokens. Internally they encode:
+
+```json
+{ "v": 1, "lastId": "stream-abc123-0" }
+```
+
+The `v` field is a version tag for forward compatibility. The `lastId` is the stream ID of the last item on the previous page. The cursor is **never** validated against the database — it is simply passed to `streamRepository.findWithCursor()` as the `afterId` parameter. If the cursor references a deleted or non-existent stream, the query returns results starting from the next valid ID (graceful degradation).
+
+#### Error responses
+
+| Condition | HTTP Status | Code | Message |
+| :--- | :--- | :--- | :--- |
+| `limit` is not a number string | 400 | VALIDATION_ERROR | `limit must be a positive integer` |
+| `limit` < 1 or > 100 | 400 | VALIDATION_ERROR | `limit must be at least 1` / `limit must be at most 100` |
+| `cursor` is empty or whitespace | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `cursor` is not valid base64url JSON | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `cursor` JSON lacks `v` or `lastId` | 400 | VALIDATION_ERROR | `cursor must be a valid opaque pagination token` |
+| `include_total` is not `"true"` or `"false"` | 400 | VALIDATION_ERROR | `include_total must be true or false` |
+| Database unavailable | 503 | SERVICE_UNAVAILABLE | `Stream list is temporarily unavailable.` |
+
+#### Regression surface
+
+The following behaviors must remain stable:
+
+1. **Default limit**: Omitting `limit` returns 20 results (not 50 as the query-param docs state — the Zod schema default overrides the route-level default).
+2. **Cursor opacity**: Clients must never construct cursors manually; they are server-generated and versioned.
+3. **`include_total` cost**: When `include_total=true`, an additional `COUNT(*)` query runs against the same filter. This is O(n) and should be used sparingly.
+4. **Empty page**: When no streams match the filter, `streams` is `[]`, `has_more` is `false`, and `next_cursor` is `null`.
+5. **Cache-Control**: Pages with all-terminal streams get `public, max-age=300`; mutable pages get `private, no-store`.
+6. **Read-your-writes**: Clients echoing `X-Fluxora-Write-Fence` from a prior write response are routed to the primary pool.
+
 ### Caching
 
 The `Cache-Control` header depends on stream status:
