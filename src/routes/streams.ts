@@ -107,6 +107,10 @@ import {
   resolveSseConnectionLimits,
   tryAcquireSseConnection,
 } from '../streams/sseConnectionLimiter.js';
+import {
+  resolveLongPollConnectionLimits,
+  tryAcquireLongPollConnection,
+} from '../streams/longPoll.js';
 import { isEnabled as isFlagEnabled } from '../config/featureFlags.js';
 import {
   RedisIdempotencyStore,
@@ -1518,11 +1522,11 @@ streamsRouter.get(
       return;
     }
 
-    // 2. Reserve connection capacity from sseConnectionLimiter
+    // 2. Reserve connection capacity from longPollConnectionLimiter
     const clientIp = getClientIp(req);
-    const sseLimits = resolveSseConnectionLimits();
+    const longPollLimits = resolveLongPollConnectionLimits();
     const apiKey = (req.headers['x-api-key'] as string | undefined) ?? undefined;
-    const connectionAttempt = tryAcquireSseConnection(clientIp, sseLimits, apiKey);
+    const connectionAttempt = tryAcquireLongPollConnection(clientIp, longPollLimits, apiKey);
 
     if (!connectionAttempt.ok) {
       res.setHeader('Retry-After', String(connectionAttempt.retryAfterSeconds));
@@ -1533,18 +1537,18 @@ streamsRouter.get(
         reason: connectionAttempt.reason,
         activeConnections: connectionAttempt.activeConnections,
         activeConnectionsForIp: connectionAttempt.activeConnectionsForIp,
-        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
-        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
       });
       throw tooManyRequests(connectionAttempt.message, {
         reason: connectionAttempt.reason,
-        maxConnectionsPerIp: sseLimits.maxConnectionsPerIp,
-        maxGlobalConnections: sseLimits.maxGlobalConnections,
+        maxConnectionsPerIp: longPollLimits.maxConnectionsPerIp,
+        maxGlobalConnections: longPollLimits.maxGlobalConnections,
         retryAfterSeconds: connectionAttempt.retryAfterSeconds,
       });
     }
 
-    const sseConnection = connectionAttempt.connection;
+    const longPollConnection = connectionAttempt.connection;
     let cleanedUp = false;
     let unsubscribeLiveUpdates: (() => void) | undefined;
     let pollTimer: NodeJS.Timeout | undefined;
@@ -1569,13 +1573,13 @@ streamsRouter.get(
         unsubscribeLiveUpdates = undefined;
       }
 
-      sseConnection.release();
+      longPollConnection.release();
       debug('Long-poll connection cleaned up', {
         id,
         requestId,
-        ip: sseConnection.ip,
+        ip: longPollConnection.ip,
         reason,
-        durationMs: Date.now() - sseConnection.acceptedAt,
+        durationMs: Date.now() - longPollConnection.acceptedAt,
       });
     }
 
@@ -1587,7 +1591,7 @@ streamsRouter.get(
       warn('Long-poll response error', {
         id,
         requestId,
-        ip: sseConnection.ip,
+        ip: longPollConnection.ip,
         error: err.message,
       });
       cleanup('response_error');
@@ -1643,9 +1647,9 @@ streamsRouter.get(
       }
       timeoutMs = parsedTimeout > 1000 ? parsedTimeout : parsedTimeout * 1000;
     }
-    // Bound timeout by max hold duration & sseLimits
+    // Bound timeout by max hold duration & longPollLimits
     const MAX_LONG_POLL_HOLD_MS = 30_000;
-    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, sseLimits.maxConnectionDurationMs);
+    timeoutMs = Math.min(timeoutMs, MAX_LONG_POLL_HOLD_MS, longPollLimits.maxConnectionDurationMs);
 
     // 5. Check historical replay if `since` was supplied
     if (sinceEventId) {
