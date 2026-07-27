@@ -395,7 +395,8 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
     );
   }
 
-  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } = parseResult.data;
+  const { sender, recipient, depositAmount, ratePerSecond, startTime, endTime } =
+    parseResult.data as NormalizedCreateInput;
 
   const amountValidation = validateAmountFields(
     { depositAmount, ratePerSecond } as Record<string, unknown>,
@@ -412,7 +413,7 @@ function normalizeCreateInput(body: Record<string, unknown>): NormalizedCreateIn
 
   const depositResult = validateDecimalString(depositAmount ?? '0', 'depositAmount');
   const validatedDeposit = depositResult.valid && depositResult.value ? depositResult.value : '0';
-  if (depositAmount !== undefined && compareDecimalStringToZero(validatedDeposit) <= 0) {
+  if (compareDecimalStringToZero(validatedDeposit) <= 0) {
     throw validationError('depositAmount must be greater than zero');
   }
 
