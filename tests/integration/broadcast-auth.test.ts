@@ -1,37 +1,39 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import jwt from 'jsonwebtoken';
 import { _resetAuditLog, getAuditEntries } from '../../src/lib/auditLog.js';
-import { getStreamHub } from '../../src/ws/hub.js';
 import { recordAuditEvent } from '../../src/lib/auditLog.js';
+import { verifyWsToken } from '../../src/middleware/tokenAuth.js';
+import { wsAuthFailureTotal } from '../../src/metrics/businessMetrics.js';
 
-/**
- * #672 — WebSocket Broadcast Authorization tests.
- *
- * These tests verify the audit logging contract for STREAM_BROADCAST events
- * and document that no HTTP endpoint can trigger broadcasts directly.
- *
- * The full integration test of streamEventService → hub.broadcast → audit
- * requires heavy mocking of the indexer pipeline. Instead we test the two
- * guarantees at the boundary:
- *
- * 1. recordAuditEvent("STREAM_BROADCAST", ...) produces a well-formed entry
- * 2. The broadcast trigger surface is indexer-only (no HTTP route calls broadcast)
- */
-vi.mock('../../src/ws/hub.js');
+vi.mock('../../src/lib/logger.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../src/lib/logger.js')>();
+  return {
+    ...original,
+    logger: {
+      ...original.logger,
+      warn: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+  };
+});
 
-describe('WebSocket Broadcast Authorization (#672)', () => {
+describe('Broadcast auth coverage (#1092)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetAuditLog();
+    wsAuthFailureTotal.reset();
   });
 
   describe('STREAM_BROADCAST audit entries', () => {
-    it('should record audit entry with correct action and resource for stream.created', () => {
+    it('records a well-formed broadcast audit entry for stream.created', () => {
       recordAuditEvent(
         'STREAM_BROADCAST',
         'stream',
         'stream-123',
         'corr-001',
-        { event: 'stream.created', eventId: 'evt-456', contractId: 'CXYZ' }
+        { event: 'stream.created', eventId: 'evt-456', contractId: 'CXYZ' },
       );
 
       const entries = getAuditEntries();
@@ -43,49 +45,30 @@ describe('WebSocket Broadcast Authorization (#672)', () => {
       expect(entries[0].meta).toEqual({ event: 'stream.created', eventId: 'evt-456', contractId: 'CXYZ' });
     });
 
-    it('should record audit entry for stream.updated', () => {
+    it('records broadcast audit entries for stream.updated and stream.cancelled', () => {
       recordAuditEvent(
         'STREAM_BROADCAST',
         'stream',
         'stream-789',
         'corr-002',
-        { event: 'stream.updated', eventId: 'evt-101' }
+        { event: 'stream.updated', eventId: 'evt-101' },
       );
-
-      const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].action).toBe('STREAM_BROADCAST');
-      expect(entries[0].resourceId).toBe('stream-789');
-      expect(entries[0].meta?.event).toBe('stream.updated');
-    });
-
-    it('should record audit entry for stream.cancelled', () => {
       recordAuditEvent(
         'STREAM_BROADCAST',
         'stream',
         'stream-202',
         'corr-003',
-        { event: 'stream.cancelled', eventId: 'evt-303' }
+        { event: 'stream.cancelled', eventId: 'evt-303' },
       );
 
       const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].action).toBe('STREAM_BROADCAST');
-      expect(entries[0].resourceId).toBe('stream-202');
-      expect(entries[0].meta?.event).toBe('stream.cancelled');
+      const broadcasts = entries.filter((entry) => entry.action === 'STREAM_BROADCAST');
+      expect(broadcasts).toHaveLength(2);
+      expect(broadcasts[0].meta?.event).toBe('stream.updated');
+      expect(broadcasts[1].meta?.event).toBe('stream.cancelled');
     });
 
-    it('should accumulate multiple broadcast audit entries', () => {
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', undefined, { event: 'stream.created' });
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's2', undefined, { event: 'stream.updated' });
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's3', undefined, { event: 'stream.cancelled' });
-
-      const entries = getAuditEntries();
-      const broadcasts = entries.filter((e) => e.action === 'STREAM_BROADCAST');
-      expect(broadcasts).toHaveLength(3);
-    });
-
-    it('should not throw when called with no correlationId or meta', () => {
+    it('does not throw when broadcast audit metadata is omitted', () => {
       expect(() => {
         recordAuditEvent('STREAM_BROADCAST', 'stream', 'stream-no-meta');
       }).not.toThrow();
@@ -97,12 +80,50 @@ describe('WebSocket Broadcast Authorization (#672)', () => {
     });
   });
 
-  describe('No HTTP endpoint triggers broadcasts', () => {
-    it('documents that hub.broadcast is only reachable from streamEventService', () => {
-      // This is an architectural assertion: no route file imports or calls
-      // hub.broadcast() directly. The broadcast path is:
-      // Blockchain Event → Indexer → StreamEventService → Hub.broadcast()
-      expect(getStreamHub).toBeDefined();
+  describe('WS auth surface for broadcast access', () => {
+    function makeReq(overrides: Partial<{ headers?: Record<string, string>; url?: string }> = {}) {
+      return {
+        headers: overrides.headers ?? {},
+        url: overrides.url ?? '/ws/streams',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as any;
+    }
+
+    it('rejects missing tokens without generating broadcast audit entries', () => {
+      const result = verifyWsToken(makeReq(), 'secret');
+
+      expect(result).toEqual({ ok: false, code: 'MISSING_TOKEN' });
+      expect(getAuditEntries()).toHaveLength(0);
+    });
+
+    it('records invalid token failures as WS_AUTH_FAILURE without creating broadcast audit entries', () => {
+      const result = verifyWsToken(makeReq({ headers: { authorization: 'Bearer bad' } }), 'secret');
+
+      expect(result).toEqual({ ok: false, code: 'INVALID_TOKEN' });
+
+      const authFailures = getAuditEntries().filter((entry) => entry.action === 'WS_AUTH_FAILURE');
+      expect(authFailures).toHaveLength(1);
+      expect(authFailures[0].meta?.reason).toBe('INVALID_TOKEN');
+      expect(getAuditEntries().some((entry) => entry.action === 'STREAM_BROADCAST')).toBe(false);
+    });
+
+    it('accepts a valid bearer token and does not emit auth failures', () => {
+      const token = jwt.sign({ sub: 'user-42', role: 'operator' }, 'secret');
+      const result = verifyWsToken(makeReq({ headers: { authorization: `Bearer ${token}` } }), 'secret');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.payload.sub).toBe('user-42');
+      }
+      expect(getAuditEntries()).toHaveLength(0);
+    });
+
+    it('increments the auth failure counter for invalid tokens', async () => {
+      verifyWsToken(makeReq({ headers: { authorization: 'Bearer bad' } }), 'secret');
+
+      const value = await wsAuthFailureTotal.get();
+      const series = value.values.find((entry) => (entry.labels as { reason?: string }).reason === 'INVALID_TOKEN');
+      expect(series?.value).toBe(1);
     });
   });
 });
