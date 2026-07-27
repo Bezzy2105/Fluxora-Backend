@@ -26,7 +26,8 @@
  * 22. StreamPaginator: nextPage() returns null after exhaustion.
  * 23. StreamPaginator: cursor forwarded correctly on subsequent pages.
  * 24. Stream type round-trip against actual /api/streams response shape.
- * 25. Error hierarchy instanceof checks.
+ * 25. StreamPaginator: edge-case behavior documented and tested.
+ * 26. Error hierarchy instanceof checks.
  * 26. Error class names and messages.
  * 27. FluxoraClientError base class inheritance.
  * 28. IdempotencyConflictError storedHash/incomingHash propagation.
@@ -749,6 +750,99 @@ describe('StreamPaginator (src/pagination.ts)', () => {
     expect(p['status']).toBe('active');
     expect(p['sender']).toBe('GSENDER');
     expect(p['recipient']).toBe('GRECIPIENT');
+  });
+
+  // Edge case: autoPaginate() continues past empty pages when has_more=true.
+  // An empty page should not terminate iteration if the server still has more pages.
+  it('autoPaginate() skips empty pages and continues when has_more=true', async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce(makeStreamListResponse([], true, 'cur-page2'))
+      .mockResolvedValueOnce(makeStreamListResponse([{ id: 'a' }, { id: 'b' }], true, 'cur-page3'))
+      .mockResolvedValueOnce(makeStreamListResponse([], true, 'cur-page4'))
+      .mockResolvedValueOnce(makeStreamListResponse([{ id: 'c' }], false, null));
+
+    const pager = new StreamPaginator(mockFetch, { limit: 2 });
+    const collected: Stream[] = [];
+    for await (const s of pager.autoPaginate()) {
+      collected.push(s);
+    }
+
+    expect(collected.map(s => s.id)).toEqual(['a', 'b', 'c']);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  // Edge case: nextPage() throws, then calling it again still terminates correctly.
+  it('nextPage() throws FluxoraApiError on non-2xx and subsequent calls also throw', async () => {
+    const mockFetch = vi.fn().mockRejectedValue(
+      new FluxoraApiError(500, 'INTERNAL_ERROR', 'Server error'),
+    );
+
+    const pager = new StreamPaginator(mockFetch, { limit: 10 });
+
+    await expect(pager.nextPage()).rejects.toThrow(FluxoraApiError);
+    await expect(pager.nextPage()).rejects.toThrow(FluxoraApiError);
+  });
+
+  // Edge case: autoPaginate() stops fetching when the for-await loop breaks early.
+  it('autoPaginate() stops fetching when the consumer breaks early', async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce(makeStreamListResponse([{ id: 'a' }], true, 'cur-2'))
+      .mockResolvedValueOnce(makeStreamListResponse([{ id: 'b' }], true, 'cur-3'));
+
+    const pager = new StreamPaginator(mockFetch, { limit: 1 });
+    const collected: Stream[] = [];
+    for await (const s of pager.autoPaginate()) {
+      collected.push(s);
+      if (collected.length === 1) break;
+    }
+
+    expect(collected.map(s => s.id)).toEqual(['a']);
+    expect(mockFetch).toHaveBeenCalledTimes(1); // stopped after break, no extra fetch
+  });
+
+  // Edge case: server returns has_more=false with empty streams array (terminal empty page).
+  it('nextPage() returns empty array when page has no streams and has_more=false', async () => {
+    const mockFetch = vi.fn(
+      () => makeStreamListResponse([], false, null),
+    );
+
+    const pager = new StreamPaginator(mockFetch, { limit: 10 });
+    const page1 = await pager.nextPage();
+    expect(page1).toEqual([]);
+    expect(Array.isArray(page1)).toBe(true);
+
+    const page2 = await pager.nextPage();
+    expect(page2).toBeNull();
+  });
+
+  // Edge case: server returns has_more=true with next_cursor=null (inconsistent but handled).
+  // The paginator should treat this as exhausted (no cursor to fetch next page).
+  it('terminates when has_more=true but next_cursor is null', async () => {
+    const mockFetch = vi.fn(
+      () => makeStreamListResponse([{ id: 'only' }], true, null),
+    );
+
+    const pager = new StreamPaginator(mockFetch, { limit: 10 });
+    const page1 = await pager.nextPage();
+    expect(page1).toMatchObject([{ id: 'only' }]);
+
+    // has_more=true but next_cursor=null -> paginator treats as exhausted
+    const page2 = await pager.nextPage();
+    expect(page2).toBeNull();
+  });
+
+  // Edge case: server returns has_more=false with a non-null next_cursor (inconsistent but handled).
+  // The cursor should be ignored and the paginator should terminate.
+  it('ignores next_cursor when has_more=false', async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce(makeStreamListResponse([{ id: 'only' }], false, 'should-be-ignored'));
+
+    const pager = new StreamPaginator(mockFetch, { limit: 10 });
+    const page1 = await pager.nextPage();
+    expect(page1).toMatchObject([{ id: "only" }]);
+
+    const page2 = await pager.nextPage();
+    expect(page2).toBeNull();
   });
 });
 
