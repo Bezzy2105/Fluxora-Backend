@@ -242,11 +242,14 @@ export async function stopBackgroundJobs(): Promise<void> {
   }
   try {
     await queue.stop();
-    setJobQueue(null);
     logger.info('Background jobs stopped');
   } catch (err) {
     logger.error('Failed to stop background jobs', undefined, {
       error: err instanceof Error ? err.message : String(err),
     });
+  } finally {
+    // Always clear the singleton so subsequent shutdown hooks
+    // or tests can detect the queue is no longer active.
+    setJobQueue(null);
   }
 }
