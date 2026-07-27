@@ -59,7 +59,7 @@ import { getRateLimitConfig } from './config/rateLimits.js';
 import { successResponse, errorResponse } from './utils/response.js';
 import { docsRouter } from './routes/docs.js';
 import { startVacuumCollector } from './metrics/vacuumCollector.js';
-import { startBackgroundJobs } from './jobs/queue.js';
+import { startBackgroundJobs, stopBackgroundJobs } from './jobs/queue.js';
 import { csrfMiddleware } from './middleware/csrf.js';
 
 export interface AppOptions {
@@ -421,6 +421,7 @@ export function createApp(options: AppOptions = {}): Express {
   if (options.pool) {
     app.locals.vacuumInterval = startVacuumCollector(options.pool);
     startBackgroundJobs(options.pool);
+    addShutdownHook(() => stopBackgroundJobs());
   }
 
   // Wire the Redis-backed idempotency store (fire-and-forget; errors handled internally).
