@@ -13,6 +13,7 @@
 
 import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import {
   STREAM_FIELD_POLICIES,
   REQUEST_FIELD_POLICIES,
@@ -34,12 +35,14 @@ import {
   notFound,
   serviceUnavailable,
   validationError,
+  tooManyRequests,
 } from '../middleware/errorHandler.js';
 import { successResponse } from '../utils/response.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { recordAuditEventToDb, recordErasureAuditLog } from '../lib/auditLog.js';
 import { getCorrelationId } from '../tracing/middleware.js';
 import { logger } from '../lib/logger.js';
+import { requireJsonContentType } from '../middleware/contentType.js';
 
 export const privacyRouter = Router();
 
@@ -85,6 +88,10 @@ function privacyHeaders(_req: Request, res: Response, next: NextFunction): void 
 }
 
 privacyRouter.use(privacyHeaders);
+
+// Apply content-type enforcement and body-size limits to all privacy routes
+privacyRouter.use(requireJsonContentType);
+privacyRouter.use(express.json({ limit: '256kb' }));
 
 /** Build a route-scoped 405 handler with an explicit Allow header. */
 function rejectUnsupportedMethods(allowedMethods: string[]) {
