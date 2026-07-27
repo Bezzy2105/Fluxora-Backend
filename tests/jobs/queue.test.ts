@@ -247,3 +247,53 @@ describe('JobQueue singleton', () => {
     expect(mod.getJobQueue()).toBeNull();
   });
 });
+
+// ── stopBackgroundJobs tests ──────────────────────────────────────────────
+
+describe('stopBackgroundJobs', () => {
+  beforeEach(async () => {
+    const { setJobQueue } = await import('../../src/jobs/queue.js');
+    setJobQueue(null);
+  });
+
+  it('stops the queue and clears the singleton when a queue is set', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockBoss = createMockBoss();
+    const q = mod.JobQueue.withBoss(mockBoss as never);
+    // Register and start so workSubscriptions is populated
+    q.register('test-job', vi.fn());
+    await q.start();
+    expect(q.isStarted).toBe(true);
+    mod.setJobQueue(q);
+
+    await mod.stopBackgroundJobs();
+
+    expect(mockBoss.offWork).toHaveBeenCalledWith('test-job');
+    expect(mockBoss.stop).toHaveBeenCalledWith({ graceful: true, timeout: 30000 });
+    expect(mod.getJobQueue()).toBeNull();
+  });
+
+  it('handles the case when no queue is set gracefully', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    mod.setJobQueue(null);
+
+    // Should not throw when no queue exists
+    await expect(mod.stopBackgroundJobs()).resolves.toBeUndefined();
+    expect(mod.getJobQueue()).toBeNull();
+  });
+
+  it('handles stop errors gracefully without throwing', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockBoss = createMockBoss();
+    mockBoss.stop.mockRejectedValueOnce(new Error('stop failed'));
+    const q = mod.JobQueue.withBoss(mockBoss as never);
+    q.register('test-job', vi.fn());
+    await q.start();
+    mod.setJobQueue(q);
+
+    // Should not throw even when boss.stop() rejects
+    await expect(mod.stopBackgroundJobs()).resolves.toBeUndefined();
+    // Singleton should still be cleared
+    expect(mod.getJobQueue()).toBeNull();
+  });
+});

@@ -180,6 +180,10 @@ export function setJobQueue(queue: JobQueue | null): void {
  * Should be called once at startup with the application's Postgres pool.
  */
 export function startBackgroundJobs(pool: Pool): void {
+  if (_jobQueue) {
+    logger.warn('Background jobs already started, skipping duplicate init');
+    return;
+  }
   const queue = new JobQueue(pool);
   setJobQueue(queue);
 
@@ -222,4 +226,30 @@ export function startBackgroundJobs(pool: Pool): void {
   }).catch((err: Error) => {
     logger.error('Failed to enqueue startup partition maintenance', undefined, { error: err.message });
   });
+}
+
+/**
+ * Stops background jobs and clears the singleton JobQueue instance.
+ *
+ * Matches the `vacuumCollector.ts` pattern where a paired stop function is
+ * exported alongside the start function. Safe to call multiple times.
+ */
+export async function stopBackgroundJobs(): Promise<void> {
+  const queue = getJobQueue();
+  if (!queue) {
+    logger.warn('No background jobs to stop — queue was never started');
+    return;
+  }
+  try {
+    await queue.stop();
+    logger.info('Background jobs stopped');
+  } catch (err) {
+    logger.error('Failed to stop background jobs', undefined, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    // Always clear the singleton so subsequent shutdown hooks
+    // or tests can detect the queue is no longer active.
+    setJobQueue(null);
+  }
 }

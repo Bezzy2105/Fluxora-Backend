@@ -122,7 +122,7 @@ export const wsMaxBufferedBytes =
  * this module multiple times, which would otherwise throw "already registered".
  */
 function metric<T>(name: string, factory: () => T): T {
-  const existing = register.getSingleMetric(name);
+  const existing = registry.getSingleMetric(name);
   if (existing) return existing as unknown as T;
   return factory();
 }
@@ -150,26 +150,6 @@ export function recordWsBroadcastBatchFlushLatency(durationSeconds: number): voi
   }
 }
 
-// ── Per-client backpressure gauge ─────────────────────────────────────────
-
-export const wsClientBufferedBytes = metric(
-  'fluxora_ws_backpressure_buffered_bytes',
-  () =>
-    new Gauge({
-      name: 'fluxora_ws_backpressure_buffered_bytes',
-      help: 'Current bufferedAmount per WebSocket connection.',
-      labelNames: ['connection_id'],
-    }),
-);
-
-export const wsMaxBufferedBytes = metric(
-  'fluxora_ws_max_buffered_bytes',
-  () =>
-    new Gauge({
-      name: 'fluxora_ws_max_buffered_bytes',
-      help: 'Maximum bufferedAmount across all connected WebSocket clients.',
-    }),
-);
 
 export const wsSlowClients = metric(
   'fluxora_ws_slow_clients',
@@ -220,12 +200,6 @@ export const wsBatchSizeExceededTotal = metric(
       help: 'Number of batch flushes triggered early by hitting the max-size cap.',
     }),
 );
-
-// ── Constants ─────────────────────────────────────────────────────────────
-
-export const DEFAULT_WS_BACKPRESSURE_INTERVAL_MS = 5_000;
-export const DEFAULT_WS_SLOW_CLIENT_BYTES = 1 * 1024 * 1024;
-export const DEFAULT_WS_STREAM_CARDINALITY_TOP_N = 20;
 
 // ── Collection ────────────────────────────────────────────────────────────
 
