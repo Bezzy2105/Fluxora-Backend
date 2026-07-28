@@ -174,7 +174,7 @@ export function buildDeploymentChecklistReport(input: {
       ? 'fail'
       : statuses.includes('warn')
         ? 'warn'
-        : parityRequired
+        : parityRequired || statuses.includes('pass')
           ? 'pass'
           : 'not_applicable';
 
