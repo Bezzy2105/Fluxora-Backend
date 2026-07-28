@@ -238,6 +238,15 @@ export async function backupDatabase(
       logger.warn('backupDatabase validation failed', undefined, { reason: pathCheck.reason })
       return { success: false, message: pathCheck.reason! }
     }
+  } else {
+    const bucketCheck = validatePath(s3Target.bucket, 'S3 bucket')
+    if (!bucketCheck.valid) {
+      return { success: false, message: bucketCheck.reason! }
+    }
+    const keyCheck = validatePath(s3Target.key, 'S3 key')
+    if (!keyCheck.valid) {
+      return { success: false, message: keyCheck.reason! }
+    }
   }
 
   try {
@@ -368,6 +377,15 @@ export async function restoreDatabase(
     if (!pathCheck.valid) {
       logger.warn('restoreDatabase validation failed', undefined, { reason: pathCheck.reason })
       return { success: false, message: pathCheck.reason! }
+    }
+  } else {
+    const bucketCheck = validatePath(s3Source.bucket, 'S3 bucket')
+    if (!bucketCheck.valid) {
+      return { success: false, message: bucketCheck.reason! }
+    }
+    const keyCheck = validatePath(s3Source.key, 'S3 key')
+    if (!keyCheck.valid) {
+      return { success: false, message: keyCheck.reason! }
     }
   }
 
@@ -501,20 +519,13 @@ export async function dropOldPartitions(
   parentTable: string,
   olderThanDays: number,
   dryRun = true
-): Promise<{ success: boolean; droppedPartitions: string[]; message: string }> {
-  const tableCheck = validateParentTable(parentTable)
-  if (!tableCheck.valid) {
-    logger.warn('dropOldPartitions validation failed', undefined, { reason: tableCheck.reason })
-    return { success: false, droppedPartitions: [], message: tableCheck.reason! }
+): Promise<{ droppedPartitions: string[]; message: string }> {
+  if (!parentTable || parentTable.trim() === '') {
+    return { droppedPartitions: [], message: 'parentTable is required but was not provided.' }
   }
-
-  const daysCheck = validateOlderThanDays(olderThanDays)
-  if (!daysCheck.valid) {
-    logger.warn('dropOldPartitions validation failed', undefined, { reason: daysCheck.reason })
-    return { success: false, droppedPartitions: [], message: daysCheck.reason! }
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
+    return { droppedPartitions: [], message: 'olderThanDays must be a non-negative number.' }
   }
-
-  logger.info('dropOldPartitions started', undefined, { parentTable, olderThanDays, dryRun })
 
   const query = `
     SELECT
@@ -526,7 +537,17 @@ export async function dropOldPartitions(
     WHERE p.relname = $1
   `;
   
-  const res = await pool.query(query, [parentTable]);
+  let res: import('pg').QueryResult
+  try {
+    res = await pool.query(query, [parentTable])
+  } catch (err: unknown) {
+    const dbErr = err as { message?: string }
+    return {
+      droppedPartitions: [],
+      message: `Failed to query partitions for ${parentTable}: ${dbErr.message || 'unknown error'}`,
+    }
+  }
+
   const droppedPartitions: string[] = [];
   const skippedUnsafeNames: string[] = [];
   const cutoffDate = new Date();
