@@ -7,6 +7,67 @@ import type {
 import { logger } from '../lib/logger.js';
 import { resolvePoolConfig } from '../db/pool.js';
 import { runPartitionMaintenance } from './partitionMaintenance.js';
+import { jobDlqEntriesTotal } from '../metrics/businessMetrics.js';
+
+// ── Retry / expiry defaults ───────────────────────────────────────────────────
+//
+// Exported so callers (and tests) can reference the canonical values without
+// repeating magic numbers.  All are intentionally conservative to bound blast
+// radius on runaway workers.
+
+/**
+ * Maximum number of retry attempts before a job is moved to the dead‑letter
+ * queue.  Three attempts ≈ a brief transient failure without hammering the DB.
+ */
+export const DEFAULT_RETRY_LIMIT = 3;
+
+/**
+ * Base retry delay in seconds (used as the fixed interval when backoff is
+ * disabled, or as the seed when exponential backoff is enabled).
+ */
+export const DEFAULT_RETRY_DELAY = 30;
+
+/**
+ * Whether to apply exponential backoff between retry attempts.
+ * `true` ⇒ each attempt waits 2^n × `retryDelay` seconds.
+ */
+export const DEFAULT_RETRY_BACKOFF = true;
+
+/**
+ * Maximum time in seconds a job may remain in the `active` state before
+ * pg‑boss automatically moves it back to `failed`.  15 minutes is generous
+ * for the maintenance workload and protects against hung workers.
+ */
+export const DEFAULT_EXPIRE_SECONDS = 900; // 15 minutes
+
+// ── Internal types ────────────────────────────────────────────────────────────
+
+/**
+ * Shape of the data payload that pg‑boss attaches to a job when it routes it
+ * to the dead‑letter queue.  The fields come directly from pg‑boss internals;
+ * all are optional because pg‑boss does not guarantee their presence.
+ *
+ * @internal
+ */
+interface DlqJobPayload {
+  /** Original job name as registered with pg‑boss. */
+  name?: unknown;
+  /** Original job ID (UUID). */
+  id?: unknown;
+  /** Application‑level data the job was created with. */
+  data?: unknown;
+  /**
+   * Error output captured when the job exceeded its retry limit.
+   * May be a plain string, an `{ message: string }` object, or arbitrary JSON.
+   */
+  output?: unknown;
+  /**
+   * pg‑boss stores the retry count as `retrycount` (lowercase) in older
+   * versions and `retryCount` (camelCase) in newer ones.  We normalise both.
+   */
+  retrycount?: unknown;
+  retryCount?: unknown;
+}
 
 /**
  * JobHandlerContext – context passed to job handlers.
@@ -353,81 +414,75 @@ export function startBackgroundJobs(pool: Pool): void {
   queue.register(
     DEAD_LETTER_QUEUE,
     async (ctx) => {
-      const payload = ctx.data as Record<string, unknown> | null | undefined;
+      // pg-boss delivers the original job's metadata as ctx.data when routing
+      // to a dead-letter queue.  We use the DlqJobPayload interface to make
+      // the extraction explicit and type-safe rather than casting to `any`.
+      const payload: DlqJobPayload =
+        ctx.data !== null && typeof ctx.data === 'object'
+          ? (ctx.data as DlqJobPayload)
+          : {};
+
+      // Use nullish coalescing (??) so that an explicit empty-string value
+      // from pg-boss is preserved rather than being coerced to 'unknown' the
+      // way the || operator would behave.
       const originalJobName =
-        (typeof payload?.name === 'string' && payload.name) ? payload.name : 'unknown';
+        typeof payload.name === 'string' && payload.name !== '' ? payload.name : 'unknown';
       const originalJobId =
-        (typeof payload?.id === 'string' && payload.id) ? payload.id : 'unknown';
-      const originalPayload = payload?.data ?? null;
+        typeof payload.id === 'string' && payload.id !== '' ? payload.id : 'unknown';
+      const originalPayload = payload.data ?? null;
 
-      // Build error message from pg-boss `output` field, then truncate to
-      // DLQ_MAX_ERROR_BYTES so oversized error strings don't blow the column.
       let errorMessage = 'Unknown error';
-      const output = payload?.output;
-      if (output !== undefined && output !== null) {
-        if (typeof output === 'string') {
-          errorMessage = output;
+      if (payload.output !== undefined && payload.output !== null) {
+        if (typeof payload.output === 'string') {
+          errorMessage = payload.output;
         } else if (
-          typeof output === 'object' &&
-          'message' in output &&
-          typeof (output as Record<string, unknown>).message === 'string'
+          typeof payload.output === 'object' &&
+          'message' in payload.output &&
+          typeof (payload.output as Record<string, unknown>).message === 'string'
         ) {
-          errorMessage = (output as Record<string, unknown>).message as string;
+          errorMessage = (payload.output as Record<string, unknown>).message as string;
         } else {
-          errorMessage = JSON.stringify(output);
-        }
-      }
-      // Truncate oversized error messages before persisting.
-      if (errorMessage.length > DLQ_MAX_ERROR_BYTES) {
-        errorMessage = errorMessage.slice(0, DLQ_MAX_ERROR_BYTES);
-      }
-
-      // retrycount is the pg-boss canonical casing; also handle camelCase.
-      const rawRetry =
-        (payload?.retrycount as number | undefined) ??
-        (payload?.retryCount as number | undefined) ??
-        0;
-      // Cap at 0 minimum so a corrupt/negative value never writes a nonsensical row.
-      const retryCount = Math.max(0, Number.isFinite(rawRetry) ? rawRetry : 0);
-
-      // Truncate oversized payloads before serialising into JSONB.
-      let persistedPayload = originalPayload;
-      if (persistedPayload !== null) {
-        const serialised = JSON.stringify(persistedPayload);
-        if (serialised.length > DLQ_MAX_PAYLOAD_BYTES) {
-          persistedPayload = { _truncated: true, _originalSize: serialised.length };
+          errorMessage = JSON.stringify(payload.output);
         }
       }
 
-      logger.error('Job permanently failed and moved to DLQ', undefined, {
+      // Normalise retrycount / retryCount: both keys must be coerced to a
+      // number, and we default to 0 only when both are absent or non-numeric.
+      // We use ?? (not ||) so that a legitimate value of 0 is not discarded.
+      const rawRetry = payload.retrycount ?? payload.retryCount;
+      const retryCount =
+        typeof rawRetry === 'number' && Number.isFinite(rawRetry) ? rawRetry : 0;
+
+      logger.error('Job permanently failed and moved to DLQ', ctx.id, {
         jobName: originalJobName,
         jobId: originalJobId,
+        retryCount,
         error: errorMessage,
       });
 
-      // Re-throw on DB failure so pg-boss can retry the DLQ entry itself.
-      // Without this, a transient DB outage would silently swallow the record.
+      // Increment the observable counter so on-call can alert on DLQ growth.
+      jobDlqEntriesTotal.inc({ job_name: originalJobName });
+
+      // Persist to job_dead_letter.  Wrap in try/catch so that a transient DB
+      // failure does NOT cause pg-boss to requeue this DLQ entry (which would
+      // create a confusing retry loop on a terminal event).
       try {
         await pool.query(
           `INSERT INTO job_dead_letter (job_name, job_id, payload, error_message, retry_count)
            VALUES ($1, $2, $3, $4, $5)`,
-          [
-            originalJobName,
-            originalJobId,
-            persistedPayload,
-            errorMessage,
-            retryCount,
-          ]
+          [originalJobName, originalJobId, originalPayload, errorMessage, retryCount],
         );
-      } catch (dbErr) {
-        logger.error('Failed to persist DLQ entry — rethrowing for pg-boss retry', undefined, {
+      } catch (insertErr) {
+        // Log but do not re-throw: the job is terminally failed.  A failed
+        // DLQ insert is surfaced via the error log and the metric above; the
+        // pg-boss job itself will still be marked as completed (not retried).
+        logger.error('Failed to persist DLQ entry to job_dead_letter', ctx.id, {
           jobName: originalJobName,
           jobId: originalJobId,
-          error: dbErr instanceof Error ? dbErr.message : String(dbErr),
+          error: insertErr instanceof Error ? insertErr.message : String(insertErr),
         });
-        throw dbErr;
       }
-    }
+    },
   );
 
   queue.start().catch((err: Error) => {

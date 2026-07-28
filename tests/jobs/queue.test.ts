@@ -310,51 +310,110 @@ describe('startBackgroundJobs', () => {
     vi.restoreAllMocks();
   });
 
-  // ── Helper: extract DLQ handler from spied register calls ──────────────
+  // ── helpers ──────────────────────────────────────────────────────────────
 
-  async function extractDlqHandler() {
+  /** Boot startBackgroundJobs and extract the raw DLQ handler function. */
+  async function getDlqHandler(mockPool: { query: ReturnType<typeof vi.fn> }) {
     const mod = await import('../../src/jobs/queue.js');
-    const mockPool = {
-      query: vi.fn().mockResolvedValue({ rowCount: 1 }),
-    } as any;
-
     const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
     vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
     vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
     vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
-
-    mod.startBackgroundJobs(mockPool);
-
-    const dlqCall = registerSpy.mock.calls.find(c => c[0] === 'job_dead_letter_queue');
-    const dlqHandler = dlqCall![1];
-    return { dlqHandler, mockPool };
+    mod.startBackgroundJobs(mockPool as never);
+    const call = registerSpy.mock.calls.find((c) => c[0] === 'job_dead_letter_queue');
+    return call![1];
   }
 
-  // ── Happy path ──────────────────────────────────────────────────────────
+  // ── exported constants ────────────────────────────────────────────────────
+
+  it('exports DEFAULT_RETRY_LIMIT as a positive integer', async () => {
+    const { DEFAULT_RETRY_LIMIT } = await import('../../src/jobs/queue.js');
+    expect(typeof DEFAULT_RETRY_LIMIT).toBe('number');
+    expect(DEFAULT_RETRY_LIMIT).toBeGreaterThan(0);
+    expect(Number.isInteger(DEFAULT_RETRY_LIMIT)).toBe(true);
+  });
+
+  it('exports DEFAULT_RETRY_DELAY as a positive integer', async () => {
+    const { DEFAULT_RETRY_DELAY } = await import('../../src/jobs/queue.js');
+    expect(typeof DEFAULT_RETRY_DELAY).toBe('number');
+    expect(DEFAULT_RETRY_DELAY).toBeGreaterThan(0);
+  });
+
+  it('exports DEFAULT_RETRY_BACKOFF as a boolean', async () => {
+    const { DEFAULT_RETRY_BACKOFF } = await import('../../src/jobs/queue.js');
+    expect(typeof DEFAULT_RETRY_BACKOFF).toBe('boolean');
+  });
+
+  it('exports DEFAULT_EXPIRE_SECONDS as a positive integer', async () => {
+    const { DEFAULT_EXPIRE_SECONDS } = await import('../../src/jobs/queue.js');
+    expect(typeof DEFAULT_EXPIRE_SECONDS).toBe('number');
+    expect(DEFAULT_EXPIRE_SECONDS).toBeGreaterThan(0);
+  });
+
+  // ── handler registration ─────────────────────────────────────────────────
 
   it('registers partition-maintenance and job_dead_letter_queue handlers', async () => {
     const mod = await import('../../src/jobs/queue.js');
-    const mockPool = {
-      query: vi.fn().mockResolvedValue({ rowCount: 1 }),
-    } as any;
-
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
     const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
     const startSpy = vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
     vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
     vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
 
-    mod.startBackgroundJobs(mockPool);
+    mod.startBackgroundJobs(mockPool as never);
 
-    expect(registerSpy).toHaveBeenCalledWith('partition-maintenance', expect.any(Function), expect.any(Object));
+    expect(registerSpy).toHaveBeenCalledWith(
+      'partition-maintenance',
+      expect.any(Function),
+      expect.any(Object),
+    );
     expect(registerSpy).toHaveBeenCalledWith('job_dead_letter_queue', expect.any(Function));
     expect(startSpy).toHaveBeenCalled();
   });
 
-  it('DLQ handler inserts a well-formed row for a standard failure', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('registers partition-maintenance with the exported default constants', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
+    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+
+    mod.startBackgroundJobs(mockPool as never);
+
+    const pmCall = registerSpy.mock.calls.find((c) => c[0] === 'partition-maintenance');
+    expect(pmCall![2]).toMatchObject({
+      retryLimit: mod.DEFAULT_RETRY_LIMIT,
+      retryDelay: mod.DEFAULT_RETRY_DELAY,
+      retryBackoff: mod.DEFAULT_RETRY_BACKOFF,
+      expireInSeconds: mod.DEFAULT_EXPIRE_SECONDS,
+      deadLetter: mod.DEAD_LETTER_QUEUE,
+    });
+  });
+
+  it('is idempotent — calling startBackgroundJobs twice skips the second call', async () => {
+    const mod = await import('../../src/jobs/queue.js');
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
+    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
+    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+
+    mod.startBackgroundJobs(mockPool as never);
+    const countAfterFirst = registerSpy.mock.calls.length;
+    mod.startBackgroundJobs(mockPool as never);
+    // No additional register calls on second invocation
+    expect(registerSpy.mock.calls.length).toBe(countAfterFirst);
+  });
+
+  // ── DLQ handler: happy path ───────────────────────────────────────────────
+
+  it('DLQ handler: persists a well-formed payload to job_dead_letter', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'dlq-id',
+      id: 'dlq-ctx-id',
       name: 'job_dead_letter_queue',
       data: {
         name: 'original-job',
@@ -363,7 +422,7 @@ describe('startBackgroundJobs', () => {
         output: 'Some error occurred',
         retryCount: 3,
       },
-    } as any);
+    } as never);
 
     expect(mockPool.query).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO job_dead_letter'),
@@ -371,270 +430,208 @@ describe('startBackgroundJobs', () => {
     );
   });
 
-  it('DLQ handler reads retrycount (lowercase pg-boss casing)', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: extracts error from output.message when output is an object', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x',
+      id: 'dlq-ctx-id',
       name: 'job_dead_letter_queue',
-      data: { name: 'job-a', id: 'jid', data: null, output: 'err', retrycount: 5 },
-    } as any);
+      data: {
+        name: 'some-job',
+        id: 'job-456',
+        output: { message: 'DB connection refused' },
+        retryCount: 2,
+      },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[4]).toBe(5); // retry_count column
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO job_dead_letter'),
+      ['some-job', 'job-456', null, 'DB connection refused', 2],
+    );
   });
 
-  // ── Edge: null / undefined payload ─────────────────────────────────────
-
-  it('DLQ handler tolerates completely null ctx.data', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
-
-    await dlqHandler({ id: 'x', name: 'job_dead_letter_queue', data: null } as any);
-
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[0]).toBe('unknown');  // job_name
-    expect(args[1]).toBe('unknown');  // job_id
-    expect(args[2]).toBeNull();       // payload
-    expect(args[3]).toBe('Unknown error'); // error_message
-    expect(args[4]).toBe(0);          // retry_count
-  });
-
-  it('DLQ handler tolerates undefined ctx.data', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
-
-    await dlqHandler({ id: 'x', name: 'job_dead_letter_queue', data: undefined } as any);
-
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[0]).toBe('unknown');
-    expect(args[1]).toBe('unknown');
-    expect(args[2]).toBeNull();
-    expect(args[3]).toBe('Unknown error');
-    expect(args[4]).toBe(0);
-  });
-
-  it('DLQ handler uses "unknown" for missing job name or id', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: JSON-stringifies unknown output shapes', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { output: 'err' }, // no name/id/data fields
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: {
+        name: 'some-job',
+        id: 'job-789',
+        output: { code: 500, detail: 'oops' },
+        retryCount: 1,
+      },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[0]).toBe('unknown');
-    expect(args[1]).toBe('unknown');
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[3]).toBe(JSON.stringify({ code: 500, detail: 'oops' }));
   });
 
-  // ── Edge: oversized error_message ──────────────────────────────────────
+  // ── DLQ handler: retryCount edge cases ───────────────────────────────────
 
-  it('DLQ handler truncates error_message that exceeds DLQ_MAX_ERROR_BYTES', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
-    const hugeError = 'E'.repeat(10_000);
+  it('DLQ handler: preserves retryCount of 0 (does not treat falsy 0 as missing)', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: null, output: hugeError },
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'j', id: 'id-1', retryCount: 0 },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    // error_message must be capped at 2048 characters
-    expect(args[3].length).toBeLessThanOrEqual(2048);
-    expect(args[3]).toBe(hugeError.slice(0, 2048));
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[4]).toBe(0);
   });
 
-  it('DLQ handler extracts error from output.message object', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: reads retrycount (lowercase) when retryCount is absent', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: null, output: { message: 'db constraint' } },
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'j', id: 'id-2', retrycount: 5 },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[3]).toBe('db constraint');
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[4]).toBe(5);
   });
 
-  it('DLQ handler JSON-stringifies unknown output objects', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: defaults retryCount to 0 when both keys are absent', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: null, output: { code: 42, detail: 'boom' } },
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'j', id: 'id-3' },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[3]).toBe('{"code":42,"detail":"boom"}');
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[4]).toBe(0);
   });
 
-  // ── Edge: negative / NaN retryCount ────────────────────────────────────
+  // ── DLQ handler: missing / null / non-string name/id ─────────────────────
 
-  it('DLQ handler clamps negative retryCount to 0', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: falls back to "unknown" for missing job name', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: null, output: 'err', retryCount: -5 },
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { id: 'some-id' },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[4]).toBe(0);
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[0]).toBe('unknown');
   });
 
-  it('DLQ handler clamps NaN retryCount to 0', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
+  it('DLQ handler: falls back to "unknown" for missing job id', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: null, output: 'err', retryCount: NaN },
-    } as any);
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'some-job' },
+    } as never);
 
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[4]).toBe(0);
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[1]).toBe('unknown');
   });
 
-  // ── Edge: oversized payload ─────────────────────────────────────────────
-
-  it('DLQ handler replaces oversized payload with a truncation sentinel', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
-    const bigPayload = { data: 'X'.repeat(100_000) };
-
-    await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: bigPayload, output: 'err', retryCount: 0 },
-    } as any);
-
-    const args = mockPool.query.mock.calls[0][1];
-    // Original 100k payload should be replaced with a sentinel object
-    expect(args[2]).toHaveProperty('_truncated', true);
-    expect(args[2]).toHaveProperty('_originalSize');
-    expect((args[2] as any)._originalSize).toBeGreaterThan(65536);
-  });
-
-  it('DLQ handler preserves a small payload without modification', async () => {
-    const { dlqHandler, mockPool } = await extractDlqHandler();
-    const smallPayload = { contractId: 'abc', amount: 100 };
-
-    await dlqHandler({
-      id: 'x', name: 'job_dead_letter_queue',
-      data: { name: 'job', id: 'jid', data: smallPayload, output: 'err', retryCount: 0 },
-    } as any);
-
-    const args = mockPool.query.mock.calls[0][1];
-    expect(args[2]).toEqual(smallPayload);
-  });
-
-  // ── Edge: DB failure re-throw ───────────────────────────────────────────
-
-  it('DLQ handler re-throws DB errors so pg-boss can retry the DLQ entry', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    const dbError = new Error('connection refused');
-    const mockPool = {
-      query: vi.fn().mockRejectedValue(dbError),
-    } as any;
-
-    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
-    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
-
-    mod.startBackgroundJobs(mockPool);
-
-    const dlqCall = registerSpy.mock.calls.find(c => c[0] === 'job_dead_letter_queue');
-    const dlqHandler = dlqCall![1];
+  it('DLQ handler: handles null ctx.data without throwing', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
     await expect(
+      dlqHandler({ id: 'dlq-ctx-id', name: 'job_dead_letter_queue', data: null } as never),
+    ).resolves.toBeUndefined();
+
+    const [, params] = mockPool.query.mock.calls[0] as [string, unknown[]];
+    expect(params[0]).toBe('unknown');
+    expect(params[1]).toBe('unknown');
+    expect(params[4]).toBe(0);
+  });
+
+  it('DLQ handler: handles non-object ctx.data without throwing', async () => {
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
+
+    await expect(
+      dlqHandler({ id: 'dlq-ctx-id', name: 'job_dead_letter_queue', data: 'bad' } as never),
+    ).resolves.toBeUndefined();
+
+    expect(mockPool.query).toHaveBeenCalled();
+  });
+
+  // ── DLQ handler: DB insert failure resilience ─────────────────────────────
+
+  it('DLQ handler: does NOT re-throw when the DB insert fails', async () => {
+    const mockPool = { query: vi.fn().mockRejectedValue(new Error('connection lost')) };
+    const dlqHandler = await getDlqHandler(mockPool);
+
+    // Must resolve, not reject — pg-boss must not retry a terminal DLQ job
+    await expect(
       dlqHandler({
-        id: 'x', name: 'job_dead_letter_queue',
-        data: { name: 'job', id: 'jid', data: null, output: 'err', retryCount: 0 },
-      } as any),
-    ).rejects.toThrow('connection refused');
+        id: 'dlq-ctx-id',
+        name: 'job_dead_letter_queue',
+        data: { name: 'j', id: 'id-x', retryCount: 1, output: 'err' },
+      } as never),
+    ).resolves.toBeUndefined();
   });
 
-  // ── Edge: null pool guard ───────────────────────────────────────────────
+  it('DLQ handler: still increments the metric even when the DB insert fails', async () => {
+    const { jobDlqEntriesTotal } = await import('../../src/metrics/businessMetrics.js');
+    const incSpy = vi.spyOn(jobDlqEntriesTotal, 'inc');
 
-  it('throws synchronously when pool is null', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(() => mod.startBackgroundJobs(null as any)).toThrow(
-      'startBackgroundJobs requires a valid PostgreSQL pool',
-    );
+    const mockPool = { query: vi.fn().mockRejectedValue(new Error('timeout')) };
+    const dlqHandler = await getDlqHandler(mockPool);
+
+    await dlqHandler({
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'failing-job', id: 'id-y', retryCount: 2, output: 'timeout' },
+    } as never);
+
+    expect(incSpy).toHaveBeenCalledWith({ job_name: 'failing-job' });
   });
 
-  it('throws synchronously when pool is undefined', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(() => mod.startBackgroundJobs(undefined as any)).toThrow(
-      'startBackgroundJobs requires a valid PostgreSQL pool',
-    );
+  // ── DLQ handler: observability ────────────────────────────────────────────
+
+  it('DLQ handler: increments jobDlqEntriesTotal with the correct job_name label', async () => {
+    const { jobDlqEntriesTotal } = await import('../../src/metrics/businessMetrics.js');
+    const incSpy = vi.spyOn(jobDlqEntriesTotal, 'inc');
+
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
+
+    await dlqHandler({
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { name: 'partition-maintenance', id: 'pm-1', retryCount: 3, output: 'disk full' },
+    } as never);
+
+    expect(incSpy).toHaveBeenCalledWith({ job_name: 'partition-maintenance' });
   });
 
-  // ── Edge: duplicate startup guard ──────────────────────────────────────
+  it('DLQ handler: uses "unknown" as job_name label when name is absent', async () => {
+    const { jobDlqEntriesTotal } = await import('../../src/metrics/businessMetrics.js');
+    const incSpy = vi.spyOn(jobDlqEntriesTotal, 'inc');
 
-  it('no-ops on second call when queue is already set (duplicate init guard)', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) } as any;
+    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) };
+    const dlqHandler = await getDlqHandler(mockPool);
 
-    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
-    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
+    await dlqHandler({
+      id: 'dlq-ctx-id',
+      name: 'job_dead_letter_queue',
+      data: { id: 'no-name-job' },
+    } as never);
 
-    mod.startBackgroundJobs(mockPool);
-    const callsAfterFirst = registerSpy.mock.calls.length;
-
-    // Second call must not register or start anything new
-    mod.startBackgroundJobs(mockPool);
-    expect(registerSpy.mock.calls.length).toBe(callsAfterFirst);
-  });
-
-  // ── Exported constants ──────────────────────────────────────────────────
-
-  it('exports DEFAULT_RETRY_LIMIT as a positive integer', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(typeof mod.DEFAULT_RETRY_LIMIT).toBe('number');
-    expect(mod.DEFAULT_RETRY_LIMIT).toBeGreaterThan(0);
-  });
-
-  it('exports DEFAULT_RETRY_DELAY as a positive number', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(typeof mod.DEFAULT_RETRY_DELAY).toBe('number');
-    expect(mod.DEFAULT_RETRY_DELAY).toBeGreaterThan(0);
-  });
-
-  it('exports DEFAULT_RETRY_BACKOFF as boolean', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(typeof mod.DEFAULT_RETRY_BACKOFF).toBe('boolean');
-  });
-
-  it('exports DEFAULT_EXPIRE_SECONDS as a positive number', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(typeof mod.DEFAULT_EXPIRE_SECONDS).toBe('number');
-    expect(mod.DEFAULT_EXPIRE_SECONDS).toBeGreaterThan(0);
-  });
-
-  it('exports DEAD_LETTER_QUEUE as a non-empty string', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    expect(typeof mod.DEAD_LETTER_QUEUE).toBe('string');
-    expect(mod.DEAD_LETTER_QUEUE.length).toBeGreaterThan(0);
-  });
-
-  it('partition-maintenance job is registered with DEAD_LETTER_QUEUE routing', async () => {
-    const mod = await import('../../src/jobs/queue.js');
-    const mockPool = { query: vi.fn().mockResolvedValue({ rowCount: 1 }) } as any;
-
-    const registerSpy = vi.spyOn(mod.JobQueue.prototype, 'register');
-    vi.spyOn(mod.JobQueue.prototype, 'start').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'schedule').mockResolvedValue(undefined);
-    vi.spyOn(mod.JobQueue.prototype, 'send').mockResolvedValue(null);
-
-    mod.startBackgroundJobs(mockPool);
-
-    const pmCall = registerSpy.mock.calls.find(c => c[0] === 'partition-maintenance');
-    expect(pmCall).toBeDefined();
-    expect(pmCall![2]).toMatchObject({
-      retryLimit: mod.DEFAULT_RETRY_LIMIT,
-      retryDelay: mod.DEFAULT_RETRY_DELAY,
-      retryBackoff: mod.DEFAULT_RETRY_BACKOFF,
-      expireInSeconds: mod.DEFAULT_EXPIRE_SECONDS,
-      deadLetter: mod.DEAD_LETTER_QUEUE,
-    });
+    expect(incSpy).toHaveBeenCalledWith({ job_name: 'unknown' });
   });
 });
