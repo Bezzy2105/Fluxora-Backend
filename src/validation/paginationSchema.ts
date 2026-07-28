@@ -13,6 +13,8 @@
  * - `limit` is capped at 100 to prevent unbounded table scans.
  * - `cursor` is validated as a non-empty string before being base64url-decoded
  *   and JSON-parsed in the route, preventing injection via crafted tokens.
+ * - `status` is validated against the known enum values so unknown strings are
+ *   rejected at the schema boundary and never reach the database layer.
  * - All values are passed to the DB as parameterised query arguments — no
  *   string interpolation occurs.
  *
@@ -24,6 +26,15 @@ import { z } from 'zod';
 export const DEFAULT_PAGE_LIMIT = 20;
 export const MAX_PAGE_LIMIT     = 100;
 export const MIN_PAGE_LIMIT     = 1;
+
+/**
+ * The set of valid stream status values accepted by the pagination API.
+ * Mirrors the `StreamStatus` type in `src/db/types.ts` and the DB CHECK
+ * constraint so that unknown strings are rejected at the schema boundary
+ * before they reach the repository or database layer.
+ */
+export const STREAM_STATUS_VALUES = ['active', 'paused', 'completed', 'cancelled'] as const;
+export type StreamStatusValue = (typeof STREAM_STATUS_VALUES)[number];
 
 export const PaginationSchema = z.object({
   /**
