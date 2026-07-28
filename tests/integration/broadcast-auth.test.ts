@@ -1,552 +1,1045 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import jwt from 'jsonwebtoken';
-import { _resetAuditLog, getAuditEntries, recordAuditEvent } from '../../src/lib/auditLog.js';
-import { verifyWsToken } from '../../src/middleware/tokenAuth.js';
-import { wsAuthFailureTotal } from '../../src/metrics/businessMetrics.js';
-import { getStreamHub, resetStreamHub } from '../../src/ws/hub.js';
-import type { IncomingMessage } from 'http';
-
-vi.mock('../../src/lib/logger.js', async (importOriginal) => {
-  const original = await importOriginal<typeof import('../../src/lib/logger.js')>();
-  return {
-    ...original,
-    logger: {
-      ...original.logger,
-      warn: vi.fn(),
-      info: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  };
-});
-
-vi.mock('../../src/ws/hub.js');
-
 /**
- * #672 / #1092 / #1094 -- WebSocket Broadcast Authorization & Integration Auth
- * Coverage tests.
+ * Integration tests for broadcast authentication and access control.
  *
- * These tests verify the audit logging contract for STREAM_BROADCAST events,
- * document the integration auth surface, and cover edge cases around broadcast
- * access control, auth failure modes, dedup, error handling, and observability.
+ * Covers the interplay between JWT auth, subscription filter authorization,
+ * recipient-based broadcast delivery, and the WebSocket upgrade handshake.
  *
- * ## Integration Auth Surface
- *
- * The broadcast path has two authentication layers:
- *
- * 1. **WebSocket upgrade auth** (optional, controlled by `WS_AUTH_REQUIRED`):
- *    - `verifyWsToken()` in `src/middleware/tokenAuth.ts` extracts a JWT from
- *      the `Authorization: Bearer <token>` header or `?token=<jwt>` query param.
- *    - When `WS_AUTH_REQUIRED=true` and `JWT_SECRET` is set, unauthenticated
- *      upgrade requests are rejected with HTTP 401 before the WebSocket
- *      handshake completes.
- *    - When `WS_AUTH_REQUIRED` is absent or false, all connections are accepted
- *      regardless of whether a token is present (backward-compatible rollout).
- *    - Auth failures emit `fluxora_ws_auth_failure_total` Prometheus counters
- *      and -- for notable codes (`INVALID_TOKEN`, `AUTH_NOT_CONFIGURED`) --
- *      write `WS_AUTH_FAILURE` audit entries. `MISSING_TOKEN` is NOT audited
- *      because it is a common benign case (e.g. public SSE connections).
- *
- * 2. **HTTP API auth** (JWT via `authenticate` middleware, API key via
- *    `authenticateApiKey` middleware):
- *    - The `streamsRouter` uses `authenticate` + `requireAuth` +
- *      `authenticateApiKey` + `requireScope('streams:read')` for the SSE
- *      endpoint (`GET /api/streams/:id/events`).
- *    - The SSE route reuses `verifyWsToken` for its own JWT check, but
- *      behaves differently from the WS upgrade path: when `WS_AUTH_REQUIRED=false`
- *      and the token is invalid (not missing), the SSE route still rejects
- *      with 401, whereas the WS upgrade path silently accepts the connection.
- *
- * ## Broadcast Access Control
- *
- * - `hub.broadcast()` is the sole broadcast entry point. It is called only
- *   from `streamEventService` (indexer pipeline) and the deprecated
- *   `streamChannel.ts` wrapper. No HTTP route calls `hub.broadcast()` directly.
- * - The hub dedupes events by `(streamId, eventId)` before fan-out.
- * - The hub splits subscribers into batched (opt-in) and immediate (default)
- *   paths, applying backpressure (drop/terminate) for slow clients.
- * - Broadcast failures are caught and logged by `streamEventService`; they
- *   never propagate back to the indexer pipeline.
- *
- * ## Audit Contract
- *
- * Every broadcast triggered by `streamEventService` records a `STREAM_BROADCAST`
- * audit entry via `recordAuditEvent()`. The entry includes the event type
- * (stream.created/updated/cancelled), eventId, and contractId in `meta`.
- *
- * The full integration test of streamEventService -> hub.broadcast -> audit
- * requires heavy mocking of the indexer pipeline. Instead we test the two
- * independently testable pieces:
- *
- * 1. recordAuditEvent("STREAM_BROADCAST", ...) produces a well-formed entry
- * 2. The broadcast trigger surface is indexer-only (no HTTP route calls broadcast)
- * 3. Auth failure modes produce the correct audit/observability signals
- * 4. The audit log never throws regardless of input shape
+ * Edge-case semantics:
+ * - streamId-based subscriptions bypass auth entirely (no recipient check)
+ * - recipientAddress subscriptions require JWT sub matching the Stellar key
+ * - Empty filters (no streamId, no recipientAddress) require JWT and auto-assign sub
+ * - Unregistered clients are rejected with UNAUTHORIZED
+ * - Broadcast with recipientAddress in event/payload only reaches that address's subscribers
+ * - WS_AUTH_REQUIRED=true rejects unauthenticated upgrades before the WebSocket handshake
  */
 
-function makeIncomingMessage(overrides: Record<string, unknown> = {}): IncomingMessage {
-  return {
-    headers: {},
-    socket: { remoteAddress: '127.0.0.1' },
-    url: '/ws/streams',
-    ...overrides,
-  } as unknown as IncomingMessage;
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import http from 'http';
+import jwt from 'jsonwebtoken';
+import { WebSocket } from 'ws';
+import { StreamHub, type StreamHubOptions, type StreamUpdateEvent } from '../../src/ws/hub.js';
+import { verifyWsToken, type WsTokenPayload } from '../../src/middleware/tokenAuth.js';
+import { _resetLimiter } from '../../src/ws/connectionLimiter.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const VALID_STELLAR_KEY = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
+const ANOTHER_STELLAR_KEY = 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR';
+const JWT_SECRET = 'test-jwt-secret-for-broadcast-auth';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function createTestServer(
+  options?: StreamHubOptions,
+): Promise<{ server: http.Server; hub: StreamHub; port: number }> {
+  const server = http.createServer();
+  const hub = new StreamHub(server, options);
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address() as { port: number };
+      resolve({ server, hub, port: addr.port });
+    });
+  });
 }
 
-describe('WebSocket Broadcast Authorization (#672, #1092)', () => {
+async function teardown(server: http.Server, hub: StreamHub): Promise<void> {
+  return new Promise((resolve) => {
+    hub.close(() => server.close(() => resolve()));
+  });
+}
+
+function connect(port: number, options?: { token?: string; path?: string }): Promise<WebSocket> {
+  const path = options?.path ?? '/ws/streams';
+  const query = options?.token ? `?token=${options.token}` : '';
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${path}${query}`);
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+  });
+}
+
+function connectWithAuth(port: number, token: string, path?: string): Promise<WebSocket> {
+  return connect(port, { token, path });
+}
+
+async function connectExpectFail(port: number, options?: { token?: string }): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const query = options?.token ? `?token=${options.token}` : '';
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/streams${query}`);
+    ws.once('unexpected-response', (_req, res) => {
+      ws.close();
+      resolve(res.statusCode);
+    });
+    ws.once('error', () => {});
+    setTimeout(() => reject(new Error('Connection did not fail within timeout')), 2000);
+  });
+}
+
+function nextMessage(ws: WebSocket, timeoutMs = 3000): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('nextMessage timed out')), timeoutMs);
+    ws.once('message', (data) => {
+      clearTimeout(timer);
+      try {
+        resolve(JSON.parse(data.toString()));
+      } catch {
+        reject(new Error(`Non-JSON message: ${data.toString()}`));
+      }
+    });
+    ws.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+function send(ws: WebSocket, msg: unknown): void {
+  ws.send(JSON.stringify(msg));
+}
+
+function signToken(payload: Partial<WsTokenPayload> & { sub: string }): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+}
+
+function resetConnectionLimiter(): void {
+  _resetLimiter();
+}
+
+// ---------------------------------------------------------------------------
+// authorizeSubscriptionFilter — direct unit tests
+// ---------------------------------------------------------------------------
+
+describe('authorizeSubscriptionFilter unit semantics', () => {
+  beforeEach(() => resetConnectionLimiter());
+
+  it('rejects filter for unregistered client', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { recipientAddress: VALID_STELLAR_KEY });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('UNAUTHORIZED');
+    expect(result.message).toContain('not registered');
+    server.close();
+  });
+
+  it('allows streamId filter without auth', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { streamId: 'stream-123' });
+    expect(result.ok).toBe(true);
+    server.close();
+  });
+
+  it('rejects recipientAddress filter when client has no authenticated subject', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { recipientAddress: VALID_STELLAR_KEY });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('UNAUTHORIZED');
+    expect(result.message).toContain('require an authenticated Stellar public key subject');
+    server.close();
+  });
+
+  it('rejects recipientAddress filter that does not match authenticated subject', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      authenticatedSubject: VALID_STELLAR_KEY,
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { recipientAddress: ANOTHER_STELLAR_KEY });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('FORBIDDEN');
+    expect(result.message).toContain('must match the authenticated subject');
+    server.close();
+  });
+
+  it('allows recipientAddress filter that matches authenticated subject', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      authenticatedSubject: VALID_STELLAR_KEY,
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { recipientAddress: VALID_STELLAR_KEY });
+    expect(result.ok).toBe(true);
+    expect(result.filter.recipientAddress).toBe(VALID_STELLAR_KEY);
+    server.close();
+  });
+
+  it('rejects empty filter (no streamId, no recipientAddress) without auth', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, {});
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('UNAUTHORIZED');
+    expect(result.message).toContain('require an authenticated Stellar public key subject');
+    server.close();
+  });
+
+  it('auto-assigns recipientAddress from authenticated subject for empty filter', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      authenticatedSubject: VALID_STELLAR_KEY,
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, {});
+    expect(result.ok).toBe(true);
+    expect(result.filter.recipientAddress).toBe(VALID_STELLAR_KEY);
+    server.close();
+  });
+
+  it('rejects empty filter when authenticated subject is not a valid Stellar key', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      authenticatedSubject: 'not-a-valid-stellar-key',
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, {});
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('UNAUTHORIZED');
+    server.close();
+  });
+
+  it('rejects recipientAddress filter when authenticated subject is not a valid Stellar key', () => {
+    const server = http.createServer();
+    const hub = new StreamHub(server, { jwtSecret: JWT_SECRET });
+    const mockWs = { readyState: WebSocket.OPEN } as WebSocket;
+    (hub as any).clients.set(mockWs, {
+      id: 'test-id',
+      connectedAt: Date.now(),
+      ip: '127.0.0.1',
+      authenticatedSubject: 'not-a-valid-stellar-key',
+      metrics: { messagesReceived: 0, messagesSent: 0, bytesReceived: 0, bytesSent: 0 },
+      subscriptionFilters: new Map(),
+      messageTimestamps: [],
+    });
+
+    const result = (hub as any).authorizeSubscriptionFilter(mockWs, { recipientAddress: VALID_STELLAR_KEY });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('UNAUTHORIZED');
+    server.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyWsToken — direct unit tests
+// ---------------------------------------------------------------------------
+
+describe('verifyWsToken edge cases', () => {
+  it('returns AUTH_NOT_CONFIGURED when secret is undefined', () => {
+    const req = { headers: {}, url: '/ws/streams' } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, undefined);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('AUTH_NOT_CONFIGURED');
+  });
+
+  it('returns MISSING_TOKEN when no auth header or query param', () => {
+    const req = { headers: {}, url: '/ws/streams' } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('MISSING_TOKEN');
+  });
+
+  it('returns MISSING_TOKEN for Authorization header without Bearer scheme', () => {
+    const req = {
+      headers: { authorization: 'Basic dXNlcjpwYXNz' },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('MISSING_TOKEN');
+  });
+
+  it('returns MISSING_TOKEN for empty Bearer token', () => {
+    const req = {
+      headers: { authorization: 'Bearer ' },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('MISSING_TOKEN');
+  });
+
+  it('extracts token from Authorization header', () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const req = {
+      headers: { authorization: `Bearer ${token}` },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(true);
+    expect((result as { ok: true; payload: WsTokenPayload }).payload.sub).toBe(VALID_STELLAR_KEY);
+  });
+
+  it('extracts token from query string when no auth header', () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const req = {
+      headers: {},
+      url: `/ws/streams?token=${token}`,
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(true);
+    expect((result as { ok: true; payload: WsTokenPayload }).payload.sub).toBe(VALID_STELLAR_KEY);
+  });
+
+  it('returns INVALID_TOKEN for expired JWT', () => {
+    const token = jwt.sign({ sub: VALID_STELLAR_KEY }, JWT_SECRET, { expiresIn: '0s' });
+    const req = {
+      headers: { authorization: `Bearer ${token}` },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('INVALID_TOKEN');
+  });
+
+  it('returns INVALID_TOKEN for tampered JWT', () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const tampered = token.slice(0, -5) + 'XXXXX';
+    const req = {
+      headers: { authorization: `Bearer ${tampered}` },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('INVALID_TOKEN');
+  });
+
+  it('returns INVALID_TOKEN for token signed with different secret', () => {
+    const token = jwt.sign({ sub: VALID_STELLAR_KEY }, 'different-secret');
+    const req = {
+      headers: { authorization: `Bearer ${token}` },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('INVALID_TOKEN');
+  });
+
+  it('prefers Authorization header over query param', () => {
+    const headerToken = signToken({ sub: VALID_STELLAR_KEY });
+    const queryToken = signToken({ sub: ANOTHER_STELLAR_KEY });
+    const req = {
+      headers: { authorization: `Bearer ${headerToken}` },
+      url: `/ws/streams?token=${queryToken}`,
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(true);
+    expect((result as { ok: true; payload: WsTokenPayload }).payload.sub).toBe(VALID_STELLAR_KEY);
+  });
+
+  it('accepts token with missing sub claim', () => {
+    const token = jwt.sign({ role: 'viewer' }, JWT_SECRET);
+    const req = {
+      headers: { authorization: `Bearer ${token}` },
+      url: '/ws/streams',
+    } as unknown as http.IncomingMessage;
+    const result = verifyWsToken(req, JWT_SECRET);
+    expect(result.ok).toBe(true);
+    expect((result as { ok: true; payload: WsTokenPayload }).payload.sub).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket upgrade auth (WS_AUTH_REQUIRED)
+// ---------------------------------------------------------------------------
+
+describe('WebSocket upgrade authentication (WS_AUTH_REQUIRED)', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  beforeEach(() => resetConnectionLimiter());
+
+  afterEach(async () => {
+    await teardown(server, hub);
+  });
+
+  it('rejects upgrade with 401 when auth required and no token', async () => {
+    ({ server, hub, port } = await createTestServer({
+      wsAuthRequired: true,
+      jwtSecret: JWT_SECRET,
+    }));
+    const statusCode = await connectExpectFail(port);
+    expect(statusCode).toBe(401);
+  });
+
+  it('rejects upgrade with 401 when auth required and invalid token', async () => {
+    ({ server, hub, port } = await createTestServer({
+      wsAuthRequired: true,
+      jwtSecret: JWT_SECRET,
+    }));
+    const statusCode = await connectExpectFail(port, { token: 'invalid-token' });
+    expect(statusCode).toBe(401);
+  });
+
+  it('accepts upgrade when auth required and valid token provided', async () => {
+    ({ server, hub, port } = await createTestServer({
+      wsAuthRequired: true,
+      jwtSecret: JWT_SECRET,
+    }));
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it('accepts upgrade when auth disabled (WS_AUTH_REQUIRED=false) regardless of token', async () => {
+    ({ server, hub, port } = await createTestServer({
+      wsAuthRequired: false,
+      jwtSecret: JWT_SECRET,
+    }));
+    const ws = await connect(port);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it('accepts upgrade when auth disabled by default (wsAuthRequired not set)', async () => {
+    ({ server, hub, port } = await createTestServer());
+    const ws = await connect(port);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it('extracts authenticated subject from valid token on upgrade', async () => {
+    ({ server, hub, port } = await createTestServer({
+      jwtSecret: JWT_SECRET,
+      wsAuthRequired: true,
+    }));
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+
+    send(ws, { type: 'subscribe', filter: {} });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const pMsg = nextMessage(ws);
+
+    hub.broadcast({
+      recipientAddress: VALID_STELLAR_KEY,
+      eventId: 'event-extract-1',
+      payload: {},
+    });
+
+    const msg = await pMsg;
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-extract-1' });
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Broadcast delivery with recipient address authorization
+// ---------------------------------------------------------------------------
+
+describe('broadcast delivery with recipient authorization', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  beforeEach(async () => {
+    resetConnectionLimiter();
+    ({ server, hub, port } = await createTestServer({ jwtSecret: JWT_SECRET }));
+  });
+
+  afterEach(async () => {
+    await teardown(server, hub);
+  });
+
+  it('delivers broadcast only to recipient-matched subscribers', async () => {
+    const tokenA = signToken({ sub: VALID_STELLAR_KEY });
+    const tokenB = signToken({ sub: ANOTHER_STELLAR_KEY });
+
+    const wsA = await connectWithAuth(port, tokenA);
+    const wsB = await connectWithAuth(port, tokenB);
+
+    send(wsA, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    send(wsB, { type: 'subscribe', recipient_address: ANOTHER_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-1',
+      payload: {},
+      recipientAddress: VALID_STELLAR_KEY,
+    });
+
+    const receivedA = await nextMessage(wsA);
+    expect(receivedA).toMatchObject({ type: 'stream_update', streamId: 'stream-1', eventId: 'event-1' });
+
+    const wsBMessages: unknown[] = [];
+    const onWsBMessage = (data: Buffer) => { wsBMessages.push(JSON.parse(data.toString())); };
+    wsB.on('message', onWsBMessage);
+    await new Promise((r) => setTimeout(r, 150));
+    wsB.removeListener('message', onWsBMessage);
+    expect(wsBMessages.length).toBe(0);
+
+    wsA.close();
+    wsB.close();
+  });
+
+  it('delivers broadcast to stream subscribers regardless of recipient', async () => {
+    const ws = await connect(port);
+    send(ws, { type: 'subscribe', stream_id: 'stream-1' });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-2',
+      payload: { recipient_address: ANOTHER_STELLAR_KEY },
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', streamId: 'stream-1', eventId: 'event-2' });
+    ws.close();
+  });
+
+  it('delivers broadcast to both stream and recipient subscribers', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const wsRecipient = await connectWithAuth(port, token);
+    const wsStream = await connect(port);
+
+    send(wsRecipient, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 50));
+    send(wsStream, { type: 'subscribe', stream_id: 'stream-1' });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const pRecipient = nextMessage(wsRecipient);
+    const pStream = nextMessage(wsStream);
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-3',
+      payload: {},
+      recipientAddress: VALID_STELLAR_KEY,
+    });
+
+    const [msgRecipient, msgStream] = await Promise.all([pRecipient, pStream]);
+    expect(msgRecipient).toMatchObject({ type: 'stream_update', eventId: 'event-3' });
+    expect(msgStream).toMatchObject({ type: 'stream_update', eventId: 'event-3' });
+
+    wsRecipient.close();
+    wsStream.close();
+  });
+
+  it('does not deliver broadcast to unsubscribed clients', async () => {
+    const ws = await connect(port);
+    const messages: unknown[] = [];
+    ws.on('message', (data) => { messages.push(JSON.parse(data.toString())); });
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-4',
+      payload: {},
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(messages.length).toBe(0);
+    ws.close();
+  });
+
+  it('extracts recipientAddress from event payload fields', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    send(ws, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-5',
+      payload: { recipient_address: VALID_STELLAR_KEY },
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-5' });
+    ws.close();
+  });
+
+  it('extracts recipientAddress from payload.recipient field', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    send(ws, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-6',
+      payload: { recipient: VALID_STELLAR_KEY },
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-6' });
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Subscription authorization via WebSocket messages
+// ---------------------------------------------------------------------------
+
+describe('subscription authorization via WebSocket messages', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
+
+  beforeEach(async () => {
+    resetConnectionLimiter();
+    ({ server, hub, port } = await createTestServer({ jwtSecret: JWT_SECRET }));
+  });
+
+  afterEach(async () => {
+    await teardown(server, hub);
+  });
+
+  it('rejects subscribe by recipientAddress when unauthenticated', async () => {
+    const ws = await connect(port);
+    send(ws, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({
+      type: 'error',
+      code: 'UNAUTHORIZED',
+    });
+    ws.close();
+  });
+
+  it('rejects subscribe by non-matching recipientAddress when authenticated', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    send(ws, { type: 'subscribe', recipient_address: ANOTHER_STELLAR_KEY });
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({
+      type: 'error',
+      code: 'FORBIDDEN',
+    });
+    ws.close();
+  });
+
+  it('allows subscribe by matching recipientAddress when authenticated', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    send(ws, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-auth-1',
+      payload: {},
+      recipientAddress: VALID_STELLAR_KEY,
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-auth-1' });
+    ws.close();
+  });
+
+  it('allows subscribe by streamId without any auth', async () => {
+    const ws = await connect(port);
+    send(ws, { type: 'subscribe', stream_id: 'stream-1' });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-stream-1',
+      payload: {},
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-stream-1' });
+    ws.close();
+  });
+
+  it('allows empty filter subscribe when authenticated (auto-assigns subject)', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+    send(ws, { type: 'subscribe', filter: {} });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-empty-1',
+      payload: {},
+      recipientAddress: VALID_STELLAR_KEY,
+    });
+
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({ type: 'stream_update', eventId: 'event-empty-1' });
+    ws.close();
+  });
+
+  it('rejects empty filter subscribe when unauthenticated', async () => {
+    const ws = await connect(port);
+    send(ws, { type: 'subscribe', filter: {} });
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({
+      type: 'error',
+      code: 'UNAUTHORIZED',
+    });
+    ws.close();
+  });
+
+  it('handles unsubscribe gracefully', async () => {
+    const token = signToken({ sub: VALID_STELLAR_KEY });
+    const ws = await connectWithAuth(port, token);
+
+    send(ws, { type: 'subscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    send(ws, { type: 'unsubscribe', recipient_address: VALID_STELLAR_KEY });
+    await new Promise((r) => setTimeout(r, 30));
+
+    hub.broadcast({
+      streamId: 'stream-1',
+      eventId: 'event-after-unsub',
+      payload: {},
+      recipientAddress: VALID_STELLAR_KEY,
+    });
+
+    const messages: unknown[] = [];
+    ws.on('message', (data) => { messages.push(JSON.parse(data.toString())); });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(messages.length).toBe(0);
+    ws.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requireScope integration
+// ---------------------------------------------------------------------------
+
+describe('requireScope integration', () => {
+  it('returns 401 when neither API key nor JWT auth is present', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-1',
+      path: '/test',
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('streams:read')(mockReq, mockRes, next);
+    expect(mockRes.statusCode).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when API key has empty scopes', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-2',
+      path: '/test',
+      keyId: 'key-1',
+      keyScopes: [],
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('streams:read')(mockReq, mockRes, next);
+    expect(mockRes.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when JWT permissions do not include required scope', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-3',
+      path: '/test',
+      user: { address: 'GABC', role: 'viewer', permissions: ['audit:read'] },
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('streams:write')(mockReq, mockRes, next);
+    expect(mockRes.statusCode).toBe(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allows access when JWT permissions include at least one required scope', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-4',
+      path: '/test',
+      user: { address: 'GABC', role: 'operator', permissions: ['streams:read', 'streams:write'] },
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('streams:read')(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('allows access when API key scopes include at least one required scope', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-5',
+      path: '/test',
+      keyId: 'key-1',
+      keyScopes: ['streams:read', 'dlq:list'],
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('dlq:list')(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('allows access with any-of matching for multiple required scopes', async () => {
+    const { requireScope } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-scope-6',
+      path: '/test',
+      keyId: 'key-1',
+      keyScopes: ['streams:read'],
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    requireScope('streams:write', 'streams:read')(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authenticate middleware — anonymous/malformed header edge cases
+// ---------------------------------------------------------------------------
+
+describe('authenticate middleware — header edge cases', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    _resetAuditLog();
-    resetStreamHub();
-    wsAuthFailureTotal.reset();
+    vi.resetModules();
   });
 
-  // -- STREAM_BROADCAST Audit Entries --------------------------------------
+  it('proceeds as anonymous when Authorization header has no Bearer scheme', async () => {
+    vi.doMock('../../src/lib/auth.js', () => ({
+      verifyToken: vi.fn(),
+    }));
+    vi.doMock('../../src/redis/jwtRevocationStore.js', () => ({
+      isRevoked: vi.fn(),
+    }));
 
-  describe('STREAM_BROADCAST audit entries', () => {
-    it('should record audit entry with correct action and resource for stream.created', () => {
-      recordAuditEvent(
-        'STREAM_BROADCAST',
-        'stream',
-        'stream-123',
-        'corr-001',
-        { event: 'stream.created', eventId: 'evt-456', contractId: 'CXYZ' }
-      );
+    const { authenticate } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-hedge-1',
+      headers: { authorization: 'Basic dGVzdDpwYXNz' },
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
 
-      const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].action).toBe('STREAM_BROADCAST');
-      expect(entries[0].resourceType).toBe('stream');
-      expect(entries[0].resourceId).toBe('stream-123');
-      expect(entries[0].correlationId).toBe('corr-001');
-      expect(entries[0].meta).toEqual({ event: 'stream.created', eventId: 'evt-456', contractId: 'CXYZ' });
-    });
-
-    it('should record audit entry for stream.updated', () => {
-      recordAuditEvent(
-        'STREAM_BROADCAST',
-        'stream',
-        'stream-789',
-        'corr-002',
-        { event: 'stream.updated', eventId: 'evt-101' }
-      );
-
-      const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].action).toBe('STREAM_BROADCAST');
-      expect(entries[0].resourceId).toBe('stream-789');
-      expect(entries[0].meta?.event).toBe('stream.updated');
-    });
-
-    it('should record audit entry for stream.cancelled', () => {
-      recordAuditEvent(
-        'STREAM_BROADCAST',
-        'stream',
-        'stream-202',
-        'corr-003',
-        { event: 'stream.cancelled', eventId: 'evt-303' }
-      );
-
-      const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].action).toBe('STREAM_BROADCAST');
-      expect(entries[0].resourceId).toBe('stream-202');
-      expect(entries[0].meta?.event).toBe('stream.cancelled');
-    });
-
-    it('should accumulate multiple broadcast audit entries', () => {
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', undefined, { event: 'stream.created' });
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's2', undefined, { event: 'stream.updated' });
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's3', undefined, { event: 'stream.cancelled' });
-
-      const entries = getAuditEntries();
-      const broadcasts = entries.filter((e) => e.action === 'STREAM_BROADCAST');
-      expect(broadcasts).toHaveLength(3);
-    });
-
-    it('should not throw when called with no correlationId or meta', () => {
-      expect(() => {
-        recordAuditEvent('STREAM_BROADCAST', 'stream', 'stream-no-meta');
-      }).not.toThrow();
-
-      const entries = getAuditEntries();
-      expect(entries).toHaveLength(1);
-      expect(entries[0].correlationId).toBeUndefined();
-      expect(entries[0].meta).toBeUndefined();
-    });
+    await authenticate(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+    expect(mockReq.user).toBeUndefined();
   });
 
-  // -- No HTTP Endpoint Triggers Broadcasts --------------------------------
+  it('proceeds as anonymous when Authorization header is absent', async () => {
+    vi.doMock('../../src/lib/auth.js', () => ({
+      verifyToken: vi.fn(),
+    }));
+    vi.doMock('../../src/redis/jwtRevocationStore.js', () => ({
+      isRevoked: vi.fn(),
+    }));
 
-  describe('No HTTP endpoint triggers broadcasts', () => {
-    it('documents that hub.broadcast is only reachable from streamEventService', () => {
-      // This is an architectural assertion: no route file imports or calls
-      // hub.broadcast() directly. The broadcast path is:
-      // Blockchain Event -> Indexer -> StreamEventService -> Hub.broadcast()
-      expect(getStreamHub).toBeDefined();
-    });
+    const { authenticate } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-hedge-2',
+      headers: {},
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
+
+    await authenticate(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+    expect(mockReq.user).toBeUndefined();
   });
 
-  // -- WS auth surface for broadcast access (added under #1092) -----------
+  it('proceeds as anonymous when Authorization is Bearer with whitespace-only token', async () => {
+    vi.doMock('../../src/lib/auth.js', () => ({
+      verifyToken: vi.fn(),
+    }));
+    vi.doMock('../../src/redis/jwtRevocationStore.js', () => ({
+      isRevoked: vi.fn(),
+    }));
 
-  describe('WS auth surface for broadcast access', () => {
-    function makeReq(overrides: Partial<{ headers?: Record<string, string>; url?: string }> = {}) {
-      return {
-        headers: overrides.headers ?? {},
-        url: overrides.url ?? '/ws/streams',
-        socket: { remoteAddress: '127.0.0.1' },
-      } as unknown as IncomingMessage;
-    }
+    const { authenticate } = await import('../../src/middleware/auth.js');
+    const mockReq = {
+      correlationId: 'req-hedge-3',
+      headers: { authorization: 'Bearer   ' },
+    } as any;
+    const mockRes = {
+      statusCode: 200,
+      jsonBody: null,
+      status(code: number) { this.statusCode = code; return this; },
+      json(body: any) { this.jsonBody = body; return this; },
+    } as any;
+    const next = vi.fn();
 
-    it('rejects missing tokens without generating broadcast audit entries', () => {
-      const result = verifyWsToken(makeReq(), 'secret');
+    await authenticate(mockReq, mockRes, next);
+    expect(next).toHaveBeenCalled();
+    expect(mockReq.user).toBeUndefined();
+  });
+});
 
-      expect(result).toEqual({ ok: false, code: 'MISSING_TOKEN' });
-      expect(getAuditEntries()).toHaveLength(0);
-    });
+// ---------------------------------------------------------------------------
+// Backward compatibility: WS without auth still works
+// ---------------------------------------------------------------------------
 
-    it('records invalid token failures as WS_AUTH_FAILURE without creating broadcast audit entries', () => {
-      const result = verifyWsToken(makeReq({ headers: { authorization: 'Bearer bad' } }), 'secret');
+describe('backward compatibility — WS without auth', () => {
+  let server: http.Server;
+  let hub: StreamHub;
+  let port: number;
 
-      expect(result).toEqual({ ok: false, code: 'INVALID_TOKEN' });
-
-      const authFailures = getAuditEntries().filter((entry) => entry.action === 'WS_AUTH_FAILURE');
-      expect(authFailures).toHaveLength(1);
-      expect(authFailures[0].meta?.reason).toBe('INVALID_TOKEN');
-      expect(getAuditEntries().some((entry) => entry.action === 'STREAM_BROADCAST')).toBe(false);
-    });
-
-    it('accepts a valid bearer token and does not emit auth failures', () => {
-      const token = jwt.sign({ sub: 'user-42', role: 'operator' }, 'secret');
-      const result = verifyWsToken(makeReq({ headers: { authorization: `Bearer ${token}` } }), 'secret');
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.payload.sub).toBe('user-42');
-      }
-      expect(getAuditEntries()).toHaveLength(0);
-    });
-
-    it('increments the auth failure counter for invalid tokens', async () => {
-      verifyWsToken(makeReq({ headers: { authorization: 'Bearer bad' } }), 'secret');
-
-      const value = await wsAuthFailureTotal.get();
-      const series = value.values.find(
-        (entry) => (entry.labels as { reason?: string }).reason === 'INVALID_TOKEN'
-      );
-      expect(series?.value).toBe(1);
-    });
+  beforeEach(async () => {
+    resetConnectionLimiter();
+    ({ server, hub, port } = await createTestServer({
+      wsAuthRequired: false,
+    }));
   });
 
-  // -- WS Auth Failure Modes ------------------------------------------------
-
-  describe('WS auth failure modes (tokenAuth.ts)', () => {
-    it('returns AUTH_NOT_CONFIGURED when JWT_SECRET is absent', () => {
-      const result = verifyWsToken(makeIncomingMessage(), undefined);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('AUTH_NOT_CONFIGURED');
-      }
-    });
-
-    it('returns MISSING_TOKEN when no token is present and secret is configured', () => {
-      const result = verifyWsToken(makeIncomingMessage(), 'some-secret');
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-
-    it('returns INVALID_TOKEN for a malformed token', () => {
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: 'Bearer invalid-token' } }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('INVALID_TOKEN');
-      }
-    });
-
-    it('returns INVALID_TOKEN for a token signed with the wrong secret', () => {
-      const badToken = jwt.sign({ sub: 'test' }, 'wrong-secret');
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: `Bearer ${badToken}` } }),
-        'correct-secret'
-      );
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('INVALID_TOKEN');
-      }
-    });
-
-    it('returns ok for a valid token', () => {
-      const token = jwt.sign(
-        { sub: 'GCSX2222222222222222222222222222222222222222222222UV' },
-        'some-secret'
-      );
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: `Bearer ${token}` } }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.payload.sub).toBe('GCSX2222222222222222222222222222222222222222222222UV');
-      }
-    });
-
-    it('returns MISSING_TOKEN when Bearer scheme is used but no token follows', () => {
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: 'Bearer' } }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-
-    it('returns MISSING_TOKEN when Authorization header is not Bearer scheme', () => {
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: 'Basic dXNlcjpwYXNz' } }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-
-    it('returns MISSING_TOKEN when token is an empty string after Bearer prefix', () => {
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: 'Bearer ' } }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-
-    it('extracts token from query string when Authorization header is absent', () => {
-      const token = jwt.sign(
-        { sub: 'GCSX2222222222222222222222222222222222222222222222UV' },
-        'some-secret'
-      );
-      const result = verifyWsToken(
-        makeIncomingMessage({ url: `/ws/streams?token=${token}` }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.payload.sub).toBe('GCSX2222222222222222222222222222222222222222222222UV');
-      }
-    });
-
-    it('prefers Authorization header over query string token', () => {
-      const headerToken = jwt.sign({ sub: 'from-header' }, 'some-secret');
-      const queryToken = jwt.sign({ sub: 'from-query' }, 'some-secret');
-      const result = verifyWsToken(
-        makeIncomingMessage({
-          headers: { authorization: `Bearer ${headerToken}` },
-          url: `/ws/streams?token=${queryToken}`,
-        }),
-        'some-secret'
-      );
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.payload.sub).toBe('from-header');
-      }
-    });
+  afterEach(async () => {
+    await teardown(server, hub);
   });
 
-  // -- WS Auth Failure Audit Coverage ---------------------------------------
+  it('unauthenticated client can subscribe by streamId and receive broadcasts', async () => {
+    const ws = await connect(port);
+    send(ws, { type: 'subscribe', stream_id: 'stream-bc-1' });
+    await new Promise((r) => setTimeout(r, 30));
 
-  describe('WS auth failure audit coverage', () => {
-    it('records WS_AUTH_FAILURE audit entry for INVALID_TOKEN', () => {
-      _resetAuditLog();
-      const req = makeIncomingMessage({ headers: { authorization: 'Bearer bad-token' } });
-      verifyWsToken(req, 'some-secret');
-
-      const entries = getAuditEntries();
-      const wsFailures = entries.filter((e) => e.action === 'WS_AUTH_FAILURE');
-      expect(wsFailures).toHaveLength(1);
-      expect(wsFailures[0].meta?.reason).toBe('INVALID_TOKEN');
+    hub.broadcast({
+      streamId: 'stream-bc-1',
+      eventId: 'event-bc-1',
+      payload: { foo: 'bar' },
     });
 
-    it('records WS_AUTH_FAILURE audit entry for AUTH_NOT_CONFIGURED', () => {
-      _resetAuditLog();
-      const req = makeIncomingMessage();
-      verifyWsToken(req, undefined);
-
-      const entries = getAuditEntries();
-      const wsFailures = entries.filter((e) => e.action === 'WS_AUTH_FAILURE');
-      expect(wsFailures).toHaveLength(1);
-      expect(wsFailures[0].meta?.reason).toBe('AUTH_NOT_CONFIGURED');
+    const msg = await nextMessage(ws);
+    expect(msg).toMatchObject({
+      type: 'stream_update',
+      streamId: 'stream-bc-1',
+      eventId: 'event-bc-1',
+      payload: { foo: 'bar' },
     });
-
-    it('does NOT record WS_AUTH_FAILURE audit entry for MISSING_TOKEN', () => {
-      _resetAuditLog();
-      const req = makeIncomingMessage();
-      verifyWsToken(req, 'some-secret');
-
-      const entries = getAuditEntries();
-      const wsFailures = entries.filter((e) => e.action === 'WS_AUTH_FAILURE');
-      expect(wsFailures).toHaveLength(0);
-    });
-
-    it('audit entry resourceType is ws_connection for WS_AUTH_FAILURE', () => {
-      _resetAuditLog();
-      const req = makeIncomingMessage({ headers: { authorization: 'Bearer bad-token' } });
-      verifyWsToken(req, 'some-secret');
-
-      const entries = getAuditEntries();
-      const wsFailures = entries.filter((e) => e.action === 'WS_AUTH_FAILURE');
-      expect(wsFailures[0].resourceType).toBe('ws_connection');
-      expect(wsFailures[0].resourceId).toBe('127.0.0.1');
-    });
+    ws.close();
   });
 
-  // -- SSE Auth Behavior ------------------------------------------------------
+  it('multiple unauthenticated clients all receive the same broadcast', async () => {
+    const ws1 = await connect(port);
+    const ws2 = await connect(port);
+    send(ws1, { type: 'subscribe', stream_id: 'stream-bc-2' });
+    send(ws2, { type: 'subscribe', stream_id: 'stream-bc-2' });
+    await new Promise((r) => setTimeout(r, 30));
 
-  describe('SSE route auth behavior (streams.ts)', () => {
-    it('SSE route rejects INVALID_TOKEN regardless of WS_AUTH_REQUIRED setting', () => {
-      // When WS_AUTH_REQUIRED=false, the WS upgrade path accepts connections
-      // without tokens. However, the SSE route (GET /api/streams/:id/events)
-      // has its own auth check that rejects INVALID_TOKEN regardless of
-      // WS_AUTH_REQUIRED. This is a deliberate difference: SSE is an HTTP
-      // endpoint and must enforce auth more strictly than the WS upgrade path.
-      const invalidToken = jwt.sign({ sub: 'test' }, 'wrong-secret');
-
-      const result = verifyWsToken(
-        makeIncomingMessage({ headers: { authorization: `Bearer ${invalidToken}` }, url: '/api/streams/s1/events' }),
-        'correct-secret'
-      );
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('INVALID_TOKEN');
-      }
+    hub.broadcast({
+      streamId: 'stream-bc-2',
+      eventId: 'event-bc-2',
+      payload: {},
     });
 
-    it('SSE route returns MISSING_TOKEN when no token is present and secret is configured', () => {
-      const result = verifyWsToken(
-        makeIncomingMessage({ url: '/api/streams/s1/events' }),
-        'some-secret'
-      );
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-
-    it('SSE route allows connections without tokens when WS_AUTH_REQUIRED is not set', () => {
-      // The SSE route only enforces auth when WS_AUTH_REQUIRED=true.
-      // When WS_AUTH_REQUIRED is absent/false, MISSING_TOKEN is accepted
-      // at the SSE route level (the route does not reject on MISSING_TOKEN).
-      // This is the backward-compatible default.
-      const result = verifyWsToken(
-        makeIncomingMessage({ url: '/api/streams/s1/events' }),
-        'some-secret'
-      );
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.code).toBe('MISSING_TOKEN');
-      }
-    });
-  });
-
-  // -- Correlation ID Propagation ----------------------------------------------
-
-  describe('Correlation ID propagation', () => {
-    it('recordAuditEvent preserves correlationId in audit entries', () => {
-      _resetAuditLog();
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', 'corr-xyz-123', { event: 'stream.created' });
-
-      const entries = getAuditEntries();
-      expect(entries[0].correlationId).toBe('corr-xyz-123');
-    });
-
-    it('recordAuditEvent handles undefined correlationId without error', () => {
-      _resetAuditLog();
-      expect(() => {
-        recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', undefined, { event: 'stream.created' });
-      }).not.toThrow();
-
-      const entries = getAuditEntries();
-      expect(entries[0].correlationId).toBeUndefined();
-    });
-  });
-
-  // -- Broadcast Access Control Surface -----------------------------------------
-
-  describe('Broadcast access control surface', () => {
-    it('hub.broadcast is not directly importable from route files', () => {
-      // This documents that the broadcast surface is limited to:
-      // 1. src/services/streamEventService.ts (indexer pipeline)
-      // 2. src/websockets/streamChannel.ts (deprecated wrapper)
-      // No route file in src/routes/ imports hub.broadcast directly.
-      const hub = getStreamHub();
-      expect(hub).toBeUndefined(); // no hub initialized in this test context (mocked)
-    });
-
-    it('streamChannel.ts deprecated broadcast() is a safe no-op when no hub is initialized', () => {
-      // The deprecated broadcast() in streamChannel.ts checks for hub
-      // existence before delegating. When no hub is initialized, it logs
-      // a warning and returns without throwing.
-      const hub = getStreamHub();
-      expect(hub).toBeUndefined();
-      // In production, broadcast() would log a warning and return silently.
-      // This is a safe no-op, not an error.
-    });
-  });
-
-  // -- Audit Log Backward Compatibility -----------------------------------------
-
-  describe('Audit log backward compatibility', () => {
-    it('recordAuditEvent never throws regardless of input shape', () => {
-      _resetAuditLog();
-      const inputs = [
-        { action: 'STREAM_BROADCAST' as const, resourceType: 'stream', resourceId: 's1' },
-        { action: 'STREAM_BROADCAST' as const, resourceType: 'stream', resourceId: 's1', correlationId: 'c1' },
-        { action: 'STREAM_BROADCAST' as const, resourceType: 'stream', resourceId: 's1', meta: { key: 'value' } },
-        { action: 'STREAM_BROADCAST' as const, resourceType: 'stream', resourceId: 's1', correlationId: 'c1', meta: { key: 'value' } },
-      ];
-
-      for (const input of inputs) {
-        expect(() => {
-          recordAuditEvent(
-            input.action,
-            input.resourceType,
-            input.resourceId,
-            input.correlationId,
-            input.meta
-          );
-        }).not.toThrow();
-      }
-    });
-
-    it('audit entries are monotonically sequenced', () => {
-      _resetAuditLog();
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', 'c1');
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's2', 'c2');
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's3', 'c3');
-
-      const entries = getAuditEntries();
-      expect(entries[0].seq).toBe(1);
-      expect(entries[1].seq).toBe(2);
-      expect(entries[2].seq).toBe(3);
-    });
-
-    it('audit entries include ISO-8601 timestamps', () => {
-      _resetAuditLog();
-      recordAuditEvent('STREAM_BROADCAST', 'stream', 's1', 'c1');
-
-      const entries = getAuditEntries();
-      expect(entries[0].timestamp).toBeDefined();
-      expect(() => new Date(entries[0].timestamp).toISOString()).not.toThrow();
-    });
+    const msg1 = await nextMessage(ws1);
+    const msg2 = await nextMessage(ws2);
+    expect(msg1).toMatchObject({ eventId: 'event-bc-2' });
+    expect(msg2).toMatchObject({ eventId: 'event-bc-2' });
+    ws1.close();
+    ws2.close();
   });
 });
