@@ -149,6 +149,77 @@ Webhook requests are signed with the configured secret and include delivery meta
 
 Consumers must treat webhook delivery as at-least-once: verify the signature, deduplicate by `x-fluxora-delivery-id`, and make handlers idempotent.
 
+## Signature verification
+
+Webhook consumers verify incoming requests by recomputing the HMAC-SHA256 signature using the shared signing secret. The verification path lives in `src/webhooks/signature.ts`.
+
+### Request headers
+
+| Header | Description |
+|--------|-------------|
+| `x-fluxora-delivery-id` | Unique identifier for the delivery (used for deduplication). |
+| `x-fluxora-timestamp` | Unix timestamp (seconds) at which the request was signed. |
+| `x-fluxora-signature` | HMAC-SHA256 hex digest of `{timestamp}.{rawBody}`. |
+| `x-fluxora-event` | Event type (e.g. `stream.updated`). |
+
+### Verification steps
+
+1. Reject if the payload exceeds `DEFAULT_MAX_WEBHOOK_BODY_BYTES` (256 KiB).
+2. Reject if the timestamp is not a positive integer.
+3. Reject if the timestamp is outside `DEFAULT_WEBHOOK_TOLERANCE_SECONDS` (300s) of the current time.
+4. Compute the expected signature and compare using a constant-time comparison (`timingSafeEqual` over HMAC-hashed inputs) to prevent timing attacks.
+5. If `isDuplicateDelivery(deliveryId)` returns true, reject with `409 duplicate_delivery`.
+
+### Secret rotation grace window
+
+When a webhook consumer rotates its signing secret via the admin API, there is a transition period during which some producers may still be signing with the old secret. To avoid spurious verification failures, the verification path supports a **bounded dual-secret grace window**:
+
+- During the grace window, **both** the previous and current secret are accepted.
+- After the grace window expires, the previous secret is **rejected** with code `previous_secret_expired` (HTTP 401).
+- The rotation timestamp and grace-window expiry are **persisted** in the `webhook_secrets` table (not held in memory), so a process restart cannot silently extend or shrink the window.
+- The default grace window is `DEFAULT_WEBHOOK_SECRET_GRACE_WINDOW_SECONDS` (86 400 seconds / 24 hours).
+
+#### Grace window parameters
+
+`verifyWebhookSignature` accepts the following optional fields for rotation support:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `secretPrevious` | `string` | The previous signing secret, valid only during the grace window. |
+| `previousSecretRotatedAt` | `number` | Unix timestamp (seconds) when the previous secret was rotated out. When omitted, the previous secret is accepted unconditionally (backward compatibility). |
+| `graceWindowSeconds` | `number` | Bounded grace window in seconds. Defaults to 86 400. Only consulted when `previousSecretRotatedAt` is also provided. |
+
+#### Rotation flow
+
+1. **Set initial secret**: `webhookSecretRepository.setSecret(id, secret)` inserts a row with no previous secret.
+2. **Rotate**: `webhookSecretRepository.rotateSecret(id, { newSecret, graceWindowSeconds })` atomically moves the current secret to `previous_secret`, sets `previous_secret_rotated_at` and `previous_secret_expires_at`, and activates the new secret as `current_secret`.
+3. **Verify**: The verification path checks both secrets. The previous secret is only accepted if `now < previous_secret_expires_at`.
+4. **Cleanup**: `webhookSecretRepository.clearExpiredPreviousSecret(id, now)` nulls out the previous secret once the grace window has expired, providing defense-in-depth so the stale secret cannot be used even if the verification path is misconfigured.
+
+#### Security properties
+
+- **Bounded acceptance**: The previous secret is rejected after `graceWindowSeconds` — no indefinite acceptance of a stale secret.
+- **Constant-time comparison**: Both secrets are verified using the same `constantTimeCompare` path, preventing timing-based secret enumeration.
+- **Persistence**: Rotation state survives process restarts because it is stored in PostgreSQL, not in-memory.
+- **Defense-in-depth cleanup**: The `clearExpiredPreviousSecret` method provides a second layer of protection by physically removing the previous secret after expiry.
+- **Backward compatibility**: When `previousSecretRotatedAt` is not provided, the previous secret is accepted unconditionally, preserving existing behavior for callers that have not yet adopted the grace window.
+
+#### Verification result codes
+
+| Code | Status | Description |
+|------|--------|-------------|
+| `ok` | 200 | Signature verified successfully. |
+| `previous_secret_expired` | 401 | The previous secret was provided but has exceeded its grace window. |
+| `signature_mismatch` | 401 | No provided secret matched the signature. |
+| `missing_secret` | 401 | No signing secret configured. |
+| `missing_delivery_id` | 401 | `x-fluxora-delivery-id` header missing. |
+| `missing_timestamp` | 401 | `x-fluxora-timestamp` header missing. |
+| `missing_signature` | 401 | `x-fluxora-signature` header missing. |
+| `invalid_timestamp` | 400 | Timestamp is not a positive integer. |
+| `timestamp_outside_tolerance` | 401 | Timestamp is outside the allowed tolerance window. |
+| `payload_too_large` | 413 | Request body exceeds the maximum allowed size. |
+| `duplicate_delivery` | 409 | Delivery ID has already been processed. |
+
 ## SSRF Protection
 
 All webhook target URLs are validated before any network call to prevent Server-Side Request Forgery (SSRF) attacks. This protection is applied in both the `WebhookDispatcher` class and the `dispatchWebhook` helper function.
