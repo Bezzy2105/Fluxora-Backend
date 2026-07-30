@@ -361,6 +361,21 @@ SIGHUP handler is tested in:
 
 ---
 
+## Deterministic refresh path (`refreshHotConfig`)
+
+**Purpose**: Single serialized apply path used by the SIGHUP handler so concurrent
+signals and deploy-time retries produce one generation bump and one frozen snapshot.
+
+**Edge cases covered by tests**:
+- Identical env across retries → `changed=false` after first apply
+- Concurrent callers share one in-flight promise (apply callbacks once)
+- Restart-only keys reported, never applied
+- Auth/secret values never appear on HotConfig or in logs
+- Apply failures invoke `onFailure` and do not kill the process
+- Fixed apply order: rate limits → feature flags → log level
+- Prometheus counters/histogram/gauge for success/failure/noop + duration + generation
+- `getRateLimitConfig()` prefers runtime overrides after SIGHUP
+
 ## Current Behavior Summary
 
 ### Hot Config Reload

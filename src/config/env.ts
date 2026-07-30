@@ -256,17 +256,24 @@ export const EnvSchema = z
     METRICS_ENABLED: booleanEnv().default(true),
     CORS_ALLOWED_ORIGINS: optionalString('CORS_ALLOWED_ORIGINS'),
 
-  WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
-  WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
-  WEBHOOK_SECRET_PREVIOUS: optionalString('WEBHOOK_SECRET_PREVIOUS'),
-  FLUXORA_WEBHOOK_SECRET: optionalString('FLUXORA_WEBHOOK_SECRET'),
-  FLUXORA_WEBHOOK_SECRET_PREVIOUS: optionalString('FLUXORA_WEBHOOK_SECRET_PREVIOUS'),
-  WEBHOOK_POLL_INTERVAL_MS: integerEnv('WEBHOOK_POLL_INTERVAL_MS', 1).default(10000),
-  WEBHOOK_BATCH_SIZE: integerEnv('WEBHOOK_BATCH_SIZE', 1, 1000).default(10),
-  WEBHOOK_RETRY_RPS: integerEnv('WEBHOOK_RETRY_RPS', 1, 1000).default(10),
-  WEBHOOK_CIRCUIT_BREAKER_THRESHOLD: integerEnv('WEBHOOK_CIRCUIT_BREAKER_THRESHOLD', 0, 1000).default(0),
-  WEBHOOK_CIRCUIT_BREAKER_RESET_MS: integerEnv('WEBHOOK_CIRCUIT_BREAKER_RESET_MS', 1).default(300_000),
-  WEBHOOK_ALLOWED_HOSTS: optionalString('WEBHOOK_ALLOWED_HOSTS'),
+    /**
+     * Tracing / OpenTelemetry knobs.
+     * Present in EnvSchema so `toConfig()` always receives validated defaults
+     * rather than `undefined` (which previously made startup config non-deterministic
+     * across deploys that omit these vars).
+     */
+    TRACING_ENABLED: booleanEnv().default(false),
+    TRACING_SAMPLE_RATE: z.preprocess(parseNumber, z.number().min(0).max(1)).default(1),
+    TRACING_SAMPLING_STRATEGY: z
+      .enum(['head', 'tail', 'always', 'never'])
+      .default('head'),
+    TRACING_HEAD_SAMPLE_RATE: z
+      .preprocess(parseNumber, z.number().min(0).max(1))
+      .optional(),
+    TRACING_TAIL_KEEP_ERRORS: booleanEnv().default(true),
+    TRACING_PER_ROUTE_OVERRIDES: optionalString('TRACING_PER_ROUTE_OVERRIDES'),
+    TRACING_OTEL_ENABLED: booleanEnv().default(false),
+    TRACING_LOG_EVENTS: booleanEnv().default(false),
 
     WEBHOOK_URL: optionalUrlString('WEBHOOK_URL'),
     WEBHOOK_SECRET: optionalString('WEBHOOK_SECRET'),
@@ -857,6 +864,8 @@ export function resetConfig(): void {
  */
 export function resetStartupEnvSnapshot(): void {
   startupEnvSnapshot = null;
+  lastHotConfig = null;
+  reloadGeneration = 0;
 }
 
 // ─── Hot-reload support ───────────────────────────────────────────────────────
@@ -880,6 +889,23 @@ export interface HotConfig {
 }
 
 /**
+ * Result of a full config-refresh cycle (parse + apply).
+ * Used by the SIGHUP handler and tests to assert deterministic outcomes.
+ */
+export interface ConfigRefreshResult {
+  /** Frozen HotConfig snapshot that was applied. */
+  hot: HotConfig;
+  /** Monotonic generation counter; increments on every successful refresh. */
+  generation: number;
+  /** Restart-only keys that differ from the startup snapshot (never applied). */
+  restartOnlyChanges: readonly RestartOnlyKey[];
+  /** Whether the refresh applied a config that differs from the previous one. */
+  changed: boolean;
+  /** Wall-clock duration of the refresh in milliseconds. */
+  durationMs: number;
+}
+
+/**
  * The set of env-var keys whose change requires a full process restart.
  * If any of these change between the startup snapshot and a SIGHUP, a WARN
  * is emitted but the new value is intentionally not applied.
@@ -896,6 +922,23 @@ type RestartOnlyKey = (typeof RESTART_ONLY_KEYS)[number];
 let startupEnvSnapshot: Readonly<Record<RestartOnlyKey, string | undefined>> | null = null;
 
 /**
+ * Last successfully built HotConfig. Exposed so request paths (rate limiter,
+ * tracing, logger) and the SIGHUP handler share one deterministic snapshot
+ * across retries and deploys — not a fresh parse of process.env each time.
+ */
+let lastHotConfig: HotConfig | null = null;
+
+/** Monotonic generation counter for successful reloads (observability + tests). */
+let reloadGeneration = 0;
+
+/**
+ * Serialize concurrent SIGHUP / refresh calls so only one apply runs at a time.
+ * Node is single-threaded, but nested/re-entrant signal handlers and tests
+ * that fire multiple refreshes in one tick still need a clear total order.
+ */
+let reloadInFlight: Promise<ConfigRefreshResult> | null = null;
+
+/**
  * Capture the current values of restart-only env variables.
  * Call this once during startup, before any SIGHUP handler is registered.
  * Subsequent calls are no-ops (the first snapshot is preserved).
@@ -910,6 +953,94 @@ export function captureStartupEnvSnapshot(): void {
 }
 
 /**
+ * Return the last HotConfig produced by `reloadHotConfig()` / `refreshHotConfig()`,
+ * or `null` if no reload has run yet. Callers that need stable mid-request
+ * views of hot config should prefer this over re-parsing process.env.
+ */
+export function getLastHotConfig(): HotConfig | null {
+  return lastHotConfig;
+}
+
+/** Monotonic generation of the last successful hot-config build (0 = never). */
+export function getHotConfigGeneration(): number {
+  return reloadGeneration;
+}
+
+/** Stable serialization of a HotConfig for equality / change detection. */
+function hotConfigFingerprint(hot: HotConfig): string {
+  return [
+    hot.rateLimitIpWindowMs ?? '',
+    hot.rateLimitIpMax ?? '',
+    hot.rateLimitApikeyWindowMs ?? '',
+    hot.rateLimitApikeyMax ?? '',
+    hot.rateLimitAdminWindowMs ?? '',
+    hot.rateLimitAdminMax ?? '',
+    hot.tracingSampleRate,
+    hot.tracingEnabled ? '1' : '0',
+    hot.logLevel,
+    hot.featureFlagsJson ?? '',
+    hot.featureFlagsFile ?? '',
+  ].join('\u0001');
+}
+
+/**
+ * Parse optional positive integers for rate-limit fields.
+ * Empty, non-numeric, zero, and negative values → undefined (use defaults).
+ * Leading/trailing whitespace is tolerated via parseInt.
+ */
+function parseOptionalPositiveInt(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n;
+}
+
+function parseFloat01(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number.parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+}
+
+function parseBoolHot(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === '') return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  return fallback;
+}
+
+const VALID_LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error'];
+
+function parseLogLevelHot(raw: string | undefined, fallback: LogLevel): LogLevel {
+  if (raw !== undefined && (VALID_LOG_LEVELS as readonly string[]).includes(raw)) {
+    return raw as LogLevel;
+  }
+  return fallback;
+}
+
+/**
+ * Detect restart-only key drift vs the startup snapshot.
+ * Emits one WARN per changed key (variable NAME only — never the value).
+ */
+function detectRestartOnlyChanges(): RestartOnlyKey[] {
+  if (startupEnvSnapshot === null) {
+    captureStartupEnvSnapshot();
+  }
+  const changed: RestartOnlyKey[] = [];
+  for (const key of RESTART_ONLY_KEYS) {
+    const original = startupEnvSnapshot![key];
+    const current = process.env[key];
+    if (current !== original) {
+      changed.push(key);
+      warn(`SIGHUP: restart-only variable ${key} changed — restart required to apply`, {
+        variable: key,
+      });
+    }
+  }
+  return changed;
+}
+
+/**
  * Parse the whitelisted hot-reloadable keys from `process.env` and return a
  * fully-built `HotConfig` object.
  *
@@ -920,72 +1051,117 @@ export function captureStartupEnvSnapshot(): void {
  * The build is atomic: the returned object is fully constructed before it is
  * returned to the caller; no intermediate state is ever visible.
  *
+ * Determinism guarantees:
+ * - Same `process.env` → same frozen HotConfig fields (stable defaults).
+ * - The latest successful build is stored and exposed via `getLastHotConfig()`.
+ * - Generation counter increments so deploys/retries can observe apply order.
+ *
  * Requires `captureStartupEnvSnapshot()` to have been called first. If it has
  * not been called yet, a snapshot is taken implicitly now so that the function
  * still works in isolation (e.g. in tests).
  */
 export function reloadHotConfig(): HotConfig {
-  // Ensure we have a baseline snapshot to compare against.
-  if (startupEnvSnapshot === null) {
-    captureStartupEnvSnapshot();
-  }
-
-  // Detect and warn about restart-only key changes.
-  for (const key of RESTART_ONLY_KEYS) {
-    const original = startupEnvSnapshot![key];
-    const current = process.env[key];
-    if (current !== original) {
-      warn(`SIGHUP: restart-only variable ${key} changed — restart required to apply`, {
-        variable: key,
-      });
-    }
-  }
-
-  // Atomically build the entire HotConfig from the current environment.
-  // Integer parsing helpers (mirrors the top-level parseInteger logic).
-  const parseOptionalInt = (raw: string | undefined): number | undefined => {
-    if (raw === undefined || raw === '') return undefined;
-    const n = Number.parseInt(raw, 10);
-    if (!Number.isFinite(n) || n <= 0) return undefined; // Reject non-positive values
-    return n;
-  };
-
-  const parseFloat01 = (raw: string | undefined, fallback: number): number => {
-    if (raw === undefined || raw === '') return fallback;
-    const n = Number.parseFloat(raw);
-    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
-  };
-
-  const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
-    if (raw === undefined || raw === '') return fallback;
-    const v = raw.trim().toLowerCase();
-    if (v === 'true' || v === '1') return true;
-    if (v === 'false' || v === '0') return false;
-    return fallback;
-  };
-
-  const validLogLevels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
-  const parseLogLevel = (raw: string | undefined, fallback: LogLevel): LogLevel => {
-    if (raw !== undefined && (validLogLevels as string[]).includes(raw)) {
-      return raw as LogLevel;
-    }
-    return fallback;
-  };
+  detectRestartOnlyChanges();
 
   const newConfig: HotConfig = {
-    rateLimitIpWindowMs: parseOptionalInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
-    rateLimitIpMax: parseOptionalInt(process.env.RATE_LIMIT_IP_MAX),
-    rateLimitApikeyWindowMs: parseOptionalInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
-    rateLimitApikeyMax: parseOptionalInt(process.env.RATE_LIMIT_APIKEY_MAX),
-    rateLimitAdminWindowMs: parseOptionalInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
-    rateLimitAdminMax: parseOptionalInt(process.env.RATE_LIMIT_ADMIN_MAX),
+    rateLimitIpWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
+    rateLimitIpMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_MAX),
+    rateLimitApikeyWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
+    rateLimitApikeyMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_MAX),
+    rateLimitAdminWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
+    rateLimitAdminMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_MAX),
     tracingSampleRate: parseFloat01(process.env.TRACING_SAMPLE_RATE, 1),
-    tracingEnabled: parseBool(process.env.TRACING_ENABLED, false),
-    logLevel: parseLogLevel(process.env.LOG_LEVEL, 'info'),
+    tracingEnabled: parseBoolHot(process.env.TRACING_ENABLED, false),
+    logLevel: parseLogLevelHot(process.env.LOG_LEVEL, 'info'),
     featureFlagsJson: process.env.FEATURE_FLAGS_JSON || undefined,
     featureFlagsFile: process.env.FEATURE_FLAGS_FILE || undefined,
   };
 
-  // Freeze to prevent accidental mutation of the returned snapshot.
-  return Object.freeze(newConfig);
+  const frozen = Object.freeze(newConfig);
+  lastHotConfig = frozen;
+  reloadGeneration += 1;
+  return frozen;
+}
+
+/**
+ * Full config-refresh path used by the SIGHUP handler.
+ *
+ * Builds a HotConfig, then invokes the provided apply callbacks in a fixed
+ * order. Concurrent callers share one in-flight promise so rapid SIGHUPs
+ * (or deploy-time retries) collapse to a single deterministic apply.
+ *
+ * Auth note: this path never reloads secrets/tokens. Restart-only keys are
+ * detected and reported but never applied.
+ *
+ * @param apply - Side-effect callbacks (rate limits, flags, log level, metrics).
+ *                Thrown errors propagate so the SIGHUP handler can log failure
+ *                without killing the process.
+ */
+export async function refreshHotConfig(apply?: {
+  applyRateLimits?: (hot: HotConfig) => void;
+  applyFeatureFlags?: () => void;
+  applyLogLevel?: (level: LogLevel) => void;
+  onSuccess?: (result: ConfigRefreshResult) => void;
+  onFailure?: (error: unknown, durationMs: number) => void;
+}): Promise<ConfigRefreshResult> {
+  // Coalesce concurrent callers onto one in-flight apply. Work is deferred to a
+  // microtask so `reloadInFlight` is assigned before any body runs — otherwise a
+  // fully-synchronous async IIFE would finish (and clear the flag) before the
+  // assignment, breaking both coalescing and sequential change detection.
+  if (reloadInFlight) {
+    return reloadInFlight;
+  }
+
+  const started = Date.now();
+  const run = Promise.resolve()
+    .then((): ConfigRefreshResult => {
+      const previous = lastHotConfig;
+      const restartOnlyChanges = detectRestartOnlyChanges();
+
+      const hot: HotConfig = Object.freeze({
+        rateLimitIpWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_WINDOW_MS),
+        rateLimitIpMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_IP_MAX),
+        rateLimitApikeyWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_WINDOW_MS),
+        rateLimitApikeyMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_APIKEY_MAX),
+        rateLimitAdminWindowMs: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_WINDOW_MS),
+        rateLimitAdminMax: parseOptionalPositiveInt(process.env.RATE_LIMIT_ADMIN_MAX),
+        tracingSampleRate: parseFloat01(process.env.TRACING_SAMPLE_RATE, 1),
+        tracingEnabled: parseBoolHot(process.env.TRACING_ENABLED, false),
+        logLevel: parseLogLevelHot(process.env.LOG_LEVEL, 'info'),
+        featureFlagsJson: process.env.FEATURE_FLAGS_JSON || undefined,
+        featureFlagsFile: process.env.FEATURE_FLAGS_FILE || undefined,
+      });
+
+      const changed =
+        previous === null || hotConfigFingerprint(previous) !== hotConfigFingerprint(hot);
+
+      // Apply side effects in a fixed order for deterministic deploys/retries.
+      apply?.applyRateLimits?.(hot);
+      apply?.applyFeatureFlags?.();
+      apply?.applyLogLevel?.(hot.logLevel);
+
+      lastHotConfig = hot;
+      reloadGeneration += 1;
+
+      const result: ConfigRefreshResult = Object.freeze({
+        hot,
+        generation: reloadGeneration,
+        restartOnlyChanges: Object.freeze([...restartOnlyChanges]),
+        changed,
+        durationMs: Date.now() - started,
+      });
+
+      apply?.onSuccess?.(result);
+      return result;
+    })
+    .catch((error: unknown) => {
+      apply?.onFailure?.(error, Date.now() - started);
+      throw error;
+    })
+    .finally(() => {
+      reloadInFlight = null;
+    });
+
+  reloadInFlight = run;
+  return run;
 }

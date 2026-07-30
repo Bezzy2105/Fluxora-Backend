@@ -300,18 +300,34 @@ reloadFlags()
 
 ## Known Limitations
 
-1. **No retry**: Reload is all-or-nothing, no retry on failure
-2. **No metrics**: Reload operations not observable via metrics
-3. **No trace**: Reload operations not visible in distributed tracing
-4. **Concurrency undefined**: Behavior with concurrent SIGHUP not specified
-5. **Limited validation**: Only basic type validation, no business rule validation
-6. **No rollback**: If reload succeeds but runtime update fails, no rollback
+1. **No retry of env source**: Reload reads `process.env` once per call (no multi-attempt parse). Concurrent SIGHUPs are coalesced via `refreshHotConfig()`'s in-flight promise so deploys/retries stay deterministic.
+2. **Limited validation**: Only basic type validation on hot keys (positive ints, log-level enum, sample-rate clamp). Business-rule validation stays with the startup `EnvSchema`.
+3. **No rollback**: If reload succeeds but a later runtime consumer fails, there is no automatic rollback of the frozen HotConfig snapshot.
+4. **Auth/secrets never hot-reloaded**: JWT, DB, Redis, indexer tokens require full restart; the refresh path only reports them via WARN.
+
+## Observability (stabilized)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `fluxora_config_reload_total` | Counter | `result=success\|failure\|noop` | Reload attempts |
+| `fluxora_config_reload_duration_seconds` | Histogram | — | Refresh wall time |
+| `fluxora_config_reload_generation` | Gauge | — | Last applied generation |
+
+Structured logs:
+- Success: `SIGHUP config reload complete` with generation, changed, durationMs, non-secret hot fields
+- Failure: `SIGHUP config reload failed` with error message (never secret values)
+- Restart-only drift: one WARN per key name only
+
+## Determinism guarantees
+
+1. Same `process.env` → same frozen `HotConfig` field values (stable defaults).
+2. Concurrent `refreshHotConfig()` callers share one in-flight apply (single generation bump).
+3. `getLastHotConfig()` / `getHotConfigGeneration()` expose the last successful snapshot for request paths and tests.
+4. Rate-limit middleware re-reads `getRateLimitConfig()` per request so runtime overrides apply immediately after SIGHUP.
+5. Auth secrets are never part of `HotConfig` and never appear in logs/metrics.
 
 ## Future Considerations
 
-1. Add metrics for reload operations (success/failure count, duration)
-2. Add distributed tracing spans for reload operations
-3. Define behavior for concurrent reloads (mutex/locking)
-4. Add validation for business rules (e.g., rate limits > 0)
-5. Consider adding retry logic for transient failures
-6. Add rollback mechanism if runtime update fails
+1. Add distributed tracing spans for reload operations
+2. Add validation for business rules (e.g., max window bounds inside reloadHotConfig)
+3. Consider rollback if a post-apply health check fails

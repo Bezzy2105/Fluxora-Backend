@@ -32,9 +32,13 @@ import {
   reloadHotConfig,
   captureStartupEnvSnapshot,
   resetStartupEnvSnapshot,
+  refreshHotConfig,
+  getLastHotConfig,
+  getHotConfigGeneration,
 } from '../../src/config/env.js';
 import {
   getRuntimeRateLimitConfig,
+  getRateLimitConfig,
   resetRuntimeRateLimitConfig,
   setRuntimeRateLimitConfig,
 } from '../../src/config/rateLimits.js';
@@ -501,5 +505,50 @@ describe('security: restart-only warn does not leak secrets', () => {
     const output = warnSpy.mock.calls.map((c) => String(c[0])).join('');
     expect(output).toContain('JWT_SECRET');
     expect(output).not.toContain(secretValue);
+  });
+});
+
+// ─── Deterministic refresh path (stabilization) ───────────────────────────────
+
+describe('refreshHotConfig + last snapshot', () => {
+  it('stores last HotConfig for getLastHotConfig consumers', () => {
+    process.env.RATE_LIMIT_IP_MAX = '111';
+    const hot = reloadHotConfig();
+    expect(getLastHotConfig()).toBe(hot);
+    expect(getHotConfigGeneration()).toBeGreaterThan(0);
+  });
+
+  it('refreshHotConfig applies rate limits via callback deterministically', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '222';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '15000';
+
+    await refreshHotConfig({
+      applyRateLimits: (hot) => {
+        setRuntimeRateLimitConfig({
+          ip: {
+            windowMs: hot.rateLimitIpWindowMs ?? 60_000,
+            max: hot.rateLimitIpMax ?? 100,
+            enabled: true,
+          },
+        });
+      },
+    });
+
+    const runtime = getRuntimeRateLimitConfig();
+    expect(runtime?.ip.max).toBe(222);
+    expect(runtime?.ip.windowMs).toBe(15_000);
+
+    // Live getRateLimitConfig must observe the runtime override
+    const live = getRateLimitConfig(process.env as Record<string, string | undefined>);
+    expect(live.ip.max).toBe(222);
+  });
+
+  it('identical env across sequential refreshes yields changed=false after first', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '50';
+    const first = await refreshHotConfig();
+    const second = await refreshHotConfig();
+    expect(first.changed).toBe(true);
+    expect(second.changed).toBe(false);
+    expect(second.hot.rateLimitIpMax).toBe(first.hot.rateLimitIpMax);
   });
 });
