@@ -6,7 +6,6 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 
 
-
 @dataclass
 class ResponseMeta:
     request_id: Optional[str] = None
@@ -29,7 +28,6 @@ class Stream:
     rate_per_second: Optional[str] = None
     start_time: Optional[int] = None
     stop_time: Optional[int] = None
-
 
 
 @dataclass
