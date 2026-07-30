@@ -17,13 +17,24 @@ import {
   reloadHotConfig,
   captureStartupEnvSnapshot,
   resetStartupEnvSnapshot,
+  refreshHotConfig,
+  getLastHotConfig,
+  getHotConfigGeneration,
 } from '../../src/config/env.js';
 import {
   getRuntimeRateLimitConfig,
+  getRateLimitConfig,
   resetRuntimeRateLimitConfig,
   setRuntimeRateLimitConfig,
 } from '../../src/config/rateLimits.js';
 import { reloadFlags, getFlags } from '../../src/config/featureFlags.js';
+import {
+  recordConfigReloadSuccess,
+  recordConfigReloadFailure,
+  configReloadTotal,
+  configReloadGeneration,
+  registry,
+} from '../../src/metrics.js';
 
 
 const HOT_KEYS = [
@@ -851,5 +862,149 @@ describe('Regression Surface Tests', () => {
     // Should parse as numbers (may exceed safe integer range)
     expect(hot.rateLimitIpMax).toBe(999999999999999);
     expect(hot.rateLimitIpWindowMs).toBe(999999999999999);
+  });
+});
+
+// ─── Deterministic refresh + observability (stabilization) ───────────────────
+
+describe('refreshHotConfig - deterministic apply path', () => {
+  it('returns the same frozen HotConfig for identical env across retries', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '150';
+    process.env.TRACING_SAMPLE_RATE = '0.25';
+    process.env.LOG_LEVEL = 'warn';
+
+    const a = await refreshHotConfig();
+    const b = await refreshHotConfig();
+
+    expect(a.hot.rateLimitIpMax).toBe(150);
+    expect(b.hot.rateLimitIpMax).toBe(150);
+    expect(a.hot.tracingSampleRate).toBe(0.25);
+    expect(b.hot.tracingSampleRate).toBe(0.25);
+    expect(a.hot.logLevel).toBe('warn');
+    expect(b.hot.logLevel).toBe('warn');
+    expect(Object.isFrozen(a.hot)).toBe(true);
+    expect(Object.isFrozen(b.hot)).toBe(true);
+    // Second call with identical env is a noop (changed=false)
+    expect(b.changed).toBe(false);
+    expect(b.generation).toBeGreaterThan(a.generation);
+  });
+
+  it('serializes concurrent refresh calls onto one in-flight apply', async () => {
+    process.env.RATE_LIMIT_IP_MAX = '77';
+    const applySpy = vi.fn();
+
+    const [r1, r2, r3] = await Promise.all([
+      refreshHotConfig({ applyRateLimits: applySpy }),
+      refreshHotConfig({ applyRateLimits: applySpy }),
+      refreshHotConfig({ applyRateLimits: applySpy }),
+    ]);
+
+    // All three callers observe the same generation / snapshot
+    expect(r1.generation).toBe(r2.generation);
+    expect(r2.generation).toBe(r3.generation);
+    expect(r1.hot.rateLimitIpMax).toBe(77);
+    // applyRateLimits invoked exactly once for the coalesced in-flight run
+    expect(applySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes last HotConfig via getLastHotConfig after reload', () => {
+    process.env.RATE_LIMIT_IP_MAX = '321';
+    const hot = reloadHotConfig();
+    expect(getLastHotConfig()).toBe(hot);
+    expect(getLastHotConfig()?.rateLimitIpMax).toBe(321);
+    expect(getHotConfigGeneration()).toBeGreaterThan(0);
+  });
+
+  it('reports restart-only changes without applying them', async () => {
+    process.env.DATABASE_URL = 'postgresql://original:5432/db';
+    captureStartupEnvSnapshot();
+    process.env.DATABASE_URL = 'postgresql://mutated:5432/db';
+    process.env.RATE_LIMIT_IP_MAX = '88';
+
+    const result = await refreshHotConfig();
+    expect(result.restartOnlyChanges).toContain('DATABASE_URL');
+    expect(result.hot.rateLimitIpMax).toBe(88);
+  });
+
+  it('never applies auth/secret values through the refresh path', async () => {
+    const secret = 'super-secret-jwt-key-do-not-apply-via-sighup-xyz';
+    process.env.JWT_SECRET = 'original-secret-xxxxxxxxxxxxxxxxxxxxxxxxxxx';
+    captureStartupEnvSnapshot();
+    process.env.JWT_SECRET = secret;
+
+    const result = await refreshHotConfig();
+    // HotConfig has no JWT field — secrets stay out of the apply surface
+    expect(Object.keys(result.hot)).not.toContain('jwtSecret');
+    expect(JSON.stringify(result.hot)).not.toContain(secret);
+    expect(result.restartOnlyChanges).toContain('JWT_SECRET');
+  });
+
+  it('invokes onFailure without throwing out of band when apply throws', async () => {
+    const onFailure = vi.fn();
+    await expect(
+      refreshHotConfig({
+        applyRateLimits: () => {
+          throw new Error('apply boom');
+        },
+        onFailure,
+      }),
+    ).rejects.toThrow('apply boom');
+    expect(onFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies rate limits and feature flags in fixed order', async () => {
+    const order: string[] = [];
+    process.env.RATE_LIMIT_IP_MAX = '10';
+    process.env.FEATURE_FLAGS_JSON = JSON.stringify([{ name: 'x', percentage: 100 }]);
+
+    await refreshHotConfig({
+      applyRateLimits: () => order.push('rate'),
+      applyFeatureFlags: () => order.push('flags'),
+      applyLogLevel: () => order.push('log'),
+    });
+
+    expect(order).toEqual(['rate', 'flags', 'log']);
+  });
+});
+
+describe('config reload observability metrics', () => {
+  it('recordConfigReloadSuccess increments success/noop counters and generation', async () => {
+    const before = await registry.getSingleMetricAsString('fluxora_config_reload_total');
+    recordConfigReloadSuccess({ changed: true, durationMs: 5, generation: 42 });
+    recordConfigReloadSuccess({ changed: false, durationMs: 1, generation: 43 });
+
+    const after = await registry.getSingleMetricAsString('fluxora_config_reload_total');
+    expect(after).toContain('fluxora_config_reload_total');
+    const gen = await registry.getSingleMetricAsString('fluxora_config_reload_generation');
+    expect(gen).toContain('43');
+    expect(after.length).toBeGreaterThan(before.length);
+    expect(configReloadTotal).toBeDefined();
+    expect(configReloadGeneration).toBeDefined();
+  });
+
+  it('recordConfigReloadFailure increments failure counter', async () => {
+    recordConfigReloadFailure(12);
+    const text = await registry.getSingleMetricAsString('fluxora_config_reload_total');
+    expect(text).toMatch(/failure/);
+  });
+});
+
+describe('getRateLimitConfig prefers runtime overrides (deploy/retry determinism)', () => {
+  it('returns runtime values after setRuntimeRateLimitConfig', () => {
+    setRuntimeRateLimitConfig({
+      ip: { windowMs: 12_000, max: 33, enabled: true },
+    });
+    const cfg = getRateLimitConfig(process.env as Record<string, string | undefined>);
+    expect(cfg.ip.max).toBe(33);
+    expect(cfg.ip.windowMs).toBe(12_000);
+  });
+
+  it('falls back to env when runtime is reset', () => {
+    process.env.RATE_LIMIT_IP_MAX = '55';
+    process.env.RATE_LIMIT_IP_WINDOW_MS = '45000';
+    resetRuntimeRateLimitConfig();
+    const cfg = getRateLimitConfig(process.env as Record<string, string | undefined>);
+    expect(cfg.ip.max).toBe(55);
+    expect(cfg.ip.windowMs).toBe(45_000);
   });
 });

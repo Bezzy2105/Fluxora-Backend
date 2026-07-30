@@ -566,3 +566,16 @@ groups:
 - The classifier is total: a thrown string, `null`, or an unrecognised object
   yields `local` / `unknown` rather than throwing. Metric recording can never
   mask the original batch failure — the error is always rethrown to the caller.
+
+
+## Config reload metrics (SIGHUP)
+
+Hot-config refresh emits the following Prometheus series (no secret labels):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `fluxora_config_reload_total` | Counter | `result` (`success` / `failure` / `noop`) | Reload attempts |
+| `fluxora_config_reload_duration_seconds` | Histogram | — | Refresh wall-clock duration |
+| `fluxora_config_reload_generation` | Gauge | — | Last successfully applied generation |
+
+See also [env-reload-behavior.md](./env-reload-behavior.md).
