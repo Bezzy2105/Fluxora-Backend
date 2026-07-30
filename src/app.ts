@@ -46,6 +46,7 @@ import { serverTimingMiddleware } from './middleware/serverTiming.js';
 import { setMtlsRequired } from './indexer/mtls.js';
 import { isShuttingDown, addShutdownHook } from './shutdown.js';
 import { startRuntimeMetrics, stopRuntimeMetrics } from './metrics/runtimeMetrics.js';
+import { startRedisSaturationMetrics, stopRedisSaturationMetrics } from './redis/client.js';
 import { drainSseEventBus } from './streams/sseEmitter.js';
 import { requestStopReplay } from './indexer/service.js';
 import { initializeIndexerLeaderElection, getIndexerLeaderElection } from './indexer/leaderElection.js';
@@ -395,6 +396,11 @@ export function createApp(options: AppOptions = {}): Express {
   startRuntimeMetrics();
   addShutdownHook(() => {
     stopRuntimeMetrics();
+  });
+
+  startRedisSaturationMetrics();
+  addShutdownHook(() => {
+    stopRedisSaturationMetrics();
   });
 
   // Shutdown hook ordering (runs after server.close() drains HTTP):
