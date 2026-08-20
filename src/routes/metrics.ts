@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import { registry } from '../metrics.js';
 import { requireAdminAuth } from '../middleware/adminAuth.js';
 import { syncWebhookMetrics } from '../metrics/businessMetrics.js';
-import { webhookDeliveryStore } from '../webhooks/store.js';
+import { webhookDeliveryStore } from '../webhooks/storeFactory.js';
 import { warn } from '../utils/logger.js';
 
 export const metricsRouter = express.Router();
@@ -32,7 +32,9 @@ metricsRouter.get('/', requireAdminAuth, async (_req: Request, res: Response) =>
      const metrics = await registry.metrics();
      res.send(metrics);
    } catch (err) {
-     warn('Failed to generate metrics', err instanceof Error ? err.message : String(err));
+     warn('Failed to generate metrics', {
+       error: err instanceof Error ? err.message : String(err),
+     });
      res.status(500).send('Failed to generate metrics');
    }
  });

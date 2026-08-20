@@ -1,3 +1,4 @@
+import type { Attributes } from '@opentelemetry/api';
 /**
  * Distributed Tracing Hooks for Fluxora Backend.
  *
@@ -650,7 +651,9 @@ export function recordCircuitBreakerTransition(
 
   // 1. OTel active span (no-throw guard)
   try {
-    trace.getActiveSpan()?.addEvent('circuit_breaker.state_change', attributes);
+    trace
+      .getActiveSpan()
+      ?.addEvent('circuit_breaker.state_change', attributes as unknown as Attributes);
   } catch {
     // tracing failures must never affect application logic
   }

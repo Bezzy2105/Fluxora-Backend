@@ -14,6 +14,24 @@ import {
   type IndexerLeaderElection,
 } from './leaderElection.js';
 import { checkReplayIntegrity } from './replayIntegrity.js';
+import {
+  recordIndexerBatchFailure,
+  recordIndexerBatchSuccess,
+} from '../metrics/indexerRed.js';
+import {
+  indexerLedgerLag,
+  indexerCatchupEtaSeconds,
+} from '../metrics/indexerLag.js';
+import {
+  indexerEventsIngestedTotal,
+  indexerLagSeconds,
+} from '../metrics/businessMetrics.js';
+import { getStellarRpcService } from '../services/stellar-rpc.js';
+
+/** Seconds elapsed since a `process.hrtime.bigint()` start mark. */
+function elapsedSecondsSince(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+}
 
 // ── Replay budget error ────────────────────────────────────────────────────────
 

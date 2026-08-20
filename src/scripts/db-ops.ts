@@ -519,7 +519,7 @@ export async function dropOldPartitions(
   parentTable: string,
   olderThanDays: number,
   dryRun = true
-): Promise<{ droppedPartitions: string[]; message: string }> {
+): Promise<{ success?: boolean; droppedPartitions: string[]; message: string }> {
   if (!parentTable || parentTable.trim() === '') {
     return { droppedPartitions: [], message: 'parentTable is required but was not provided.' }
   }
@@ -553,7 +553,10 @@ export async function dropOldPartitions(
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
   
-  for (const row of res.rows) {
+  for (const row of res.rows as Array<{
+    partition_name: string;
+    partition_bound: string | null;
+  }>) {
     const pName = row.partition_name;
     const pBound = row.partition_bound;
     

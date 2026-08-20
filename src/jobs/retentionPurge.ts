@@ -189,7 +189,13 @@ export async function runRetentionPurge(options: PurgeJobOptions = {}): Promise<
   });
 
   for (const rule of PURGEABLE_RETENTION_SCHEDULE) {
-    const ruleResult = await purgeRule(rule, { batchSize, now, pool, correlationId, dryRun });
+    const ruleResult = await purgeRule(rule, {
+      batchSize,
+      now,
+      pool,
+      correlationId: correlationId ?? '',
+      dryRun,
+    });
     results.push(ruleResult);
     totalRowsPurged += ruleResult.rowsPurged;
     totalRowsSkipped += ruleResult.rowsSkipped;
@@ -205,7 +211,7 @@ export async function runRetentionPurge(options: PurgeJobOptions = {}): Promise<
     results,
   };
 
-  logger.info('Retention purge job complete', correlationId, summary);
+  logger.info('Retention purge job complete', correlationId, { ...summary });
   return summary;
 }
 

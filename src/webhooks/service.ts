@@ -18,7 +18,7 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './storeFactory.js';
 import { computeWebhookSignature } from './signature.js';
-import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
+import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy, isRetryableStatusCode } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds, safeObserveDuration } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
 import { getWebhookCircuitBreakerStore } from '../redis/webhookCircuitBreakerStore.js';

@@ -185,7 +185,9 @@ healthRouter.get('/deployment', async (req: Request, res: Response) => {
     const dependencyHealth = healthManager
       ? await healthManager.checkAll()
       : { status: 'healthy' as HealthStatus, version: '0.1.0', timestamp: new Date().toISOString(), uptime: 0, dependencies: [] };
-    const indexerHealth = getIndexerHealth();
+    // getIndexerHealth() returns the ingestion snapshot, which is a different
+    // shape; the checklist wants the assessed IndexerHealth.
+    const indexerHealth = assessIndexerHealth();
     const report = buildDeploymentChecklistReport({ config, dependencyHealth, indexerHealth });
     const statusCode = report.status === 'fail' ? 503 : 200;
     res.status(statusCode).json({ report });

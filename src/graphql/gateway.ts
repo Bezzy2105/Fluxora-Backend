@@ -249,13 +249,16 @@ graphqlGatewayRouter.post(
 
       // ── Sanitise errors ─────────────────────────────────────────────────────
       if (result.errors && result.errors.length > 0) {
+        // Spreading a GraphQLError yields a plain object (no toJSON), which is
+        // fine here because the result is serialised by res.json() immediately
+        // below and never used as a GraphQLError again.
         result.errors = result.errors.map((err) => ({
           ...err,
           message: sanitiseGraphQLError(err.message),
           ...(err.extensions
             ? { extensions: sanitiseExtensions(err.extensions) }
             : {}),
-        }));
+        })) as unknown as typeof result.errors;
       }
 
       res.json(result);

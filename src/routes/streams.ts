@@ -140,6 +140,7 @@ import {
   NoOpIdempotencyStore,
   InMemoryIdempotencyStore,
   type IdempotencyStore,
+  ENVELOPE_VERSION,
 } from '../redis/idempotencyStore.js';
 import { toStreamJsonLd } from '../serialization/jsonld.js';
 export const streamsRouter = Router();
@@ -505,7 +506,8 @@ export function enforceStreamScope(req: Request, res: Response, next: NextFuncti
   const callerAddress = req.user.address as string | undefined;
   if (!callerAddress) {
     // Should not happen if authenticate middleware is working, but safe fail.
-    return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Caller address missing' } });
+    return;
   }
 
   // Attach caller address to the request object for repository consumption.
@@ -991,7 +993,7 @@ streamsRouter.post(
     const responseEnvelope = successResponse(stream, requestId);
     await idempotencyStore.set(
       idempotencyKey,
-      { requestFingerprint, statusCode: 201, body: responseEnvelope },
+      { version: ENVELOPE_VERSION, requestFingerprint, statusCode: 201, body: responseEnvelope },
       idempotencyTtlSeconds,
     );
 

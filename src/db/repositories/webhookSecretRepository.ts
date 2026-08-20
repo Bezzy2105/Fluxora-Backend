@@ -212,7 +212,7 @@ export const webhookSecretRepository = {
           AND previous_secret_expires_at <= $2`,
       [id, now],
     );
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   },
 
   /**
@@ -226,6 +226,6 @@ export const webhookSecretRepository = {
       `DELETE FROM webhook_secrets WHERE id = $1`,
       [id],
     );
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   },
 };

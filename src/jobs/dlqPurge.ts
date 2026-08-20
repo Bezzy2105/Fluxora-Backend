@@ -207,6 +207,6 @@ export async function runDlqPurge(
     batchSize,
   };
 
-  logger.info('DLQ retention purge complete', correlationId, summary);
+  logger.info('DLQ retention purge complete', correlationId, { ...summary });
   return summary;
 }

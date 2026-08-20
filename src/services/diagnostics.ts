@@ -170,11 +170,13 @@ function defaultGetCircuitBreakerState(): CircuitBreakerSnapshot {
 
 function defaultGetIndexerLagSeconds(): number {
   try {
-    const result = indexerLagSeconds.get();
-    // prom-client Gauge.get() returns { value: number } for unlabeled gauges.
-    if (typeof result === 'number') return result;
-    if (result && typeof result.value === 'number') return result.value;
-    return 0;
+    // prom-client Gauge.get() resolves to { values: [{ value }] }; for an
+    // unlabeled gauge the current reading is the first entry.
+    const result = indexerLagSeconds.get() as unknown as {
+      values?: Array<{ value?: number }>;
+    };
+    const first = result?.values?.[0]?.value;
+    return typeof first === 'number' ? first : 0;
   } catch {
     return 0;
   }

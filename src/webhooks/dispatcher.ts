@@ -125,7 +125,7 @@ export class WebhookDispatcher {
     const signature = computeWebhookSignature(secret, timestamp, payload);
 
     try {
-      const response = await this.sendRequest(validatedUrl, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
+      const response = await this.sendRequest(url, payload, deliveryId, eventType, timestamp, signature, effectiveCorrelationId);
       
       const attempt: WebhookDeliveryAttempt = {
         attemptNumber,
@@ -134,7 +134,7 @@ export class WebhookDispatcher {
       };
 
       if (response.ok) {
-        await circuitBreakerStore.recordSuccess(validatedUrl, enhancedPolicy as CircuitBreakerPolicy);
+        await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
           eventType,
@@ -154,8 +154,8 @@ export class WebhookDispatcher {
       attempt.error = errorMessage;
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -221,8 +221,8 @@ export class WebhookDispatcher {
       };
 
       const consecutiveFailures = countsTowardCircuitBreaker(attempt, this.policy)
-        ? (await circuitBreakerStore.recordFailure(validatedUrl, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
-        : (await circuitBreakerStore.getState(validatedUrl))?.consecutiveFailures ?? 0;
+        ? (await circuitBreakerStore.recordFailure(url, enhancedPolicy as CircuitBreakerPolicy)).consecutiveFailures
+        : (await circuitBreakerStore.getState(url))?.consecutiveFailures ?? 0;
       const retryable = shouldRetry(attempt, attemptNumber, this.policy, consecutiveFailures);
       
       if (retryable) {
@@ -304,7 +304,8 @@ export class WebhookDispatcher {
         
         // Validate the redirect URL with SSRF guard
         try {
-          currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+          await validateWebhookTarget(redirectUrl, { allowlist });
+          currentUrl = redirectUrl;
         } catch (error) {
           if (error instanceof WebhookTargetValidationError) {
             logger.error('Redirect target rejected by SSRF guard', undefined, {
@@ -425,7 +426,8 @@ export class WebhookDispatcher {
 
         const redirectUrl = new URL(locationHeader, currentUrl).toString();
         try {
-          currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+          await validateWebhookTarget(redirectUrl, { allowlist });
+          currentUrl = redirectUrl;
         } catch (error) {
           if (error instanceof WebhookTargetValidationError) {
             logger.error('Redirect target rejected by SSRF guard during validation');
@@ -528,7 +530,8 @@ async function followDispatchWebhookRedirects(
 
       const redirectUrl = new URL(locationHeader, currentUrl).toString();
       try {
-        currentUrl = await validateWebhookTarget(redirectUrl, { allowlist });
+        await validateWebhookTarget(redirectUrl, { allowlist });
+        currentUrl = redirectUrl;
       } catch (error) {
         if (error instanceof WebhookTargetValidationError) {
           logger.error('Redirect target rejected by SSRF guard during webhook dispatch', undefined, {

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
-import { type IdempotencyStore } from '../redis/idempotencyStore.js';
+import { type IdempotencyStore, ENVELOPE_VERSION } from '../redis/idempotencyStore.js';
 import { logger } from '../lib/logger.js';
 import { idempotentReplayResponse } from '../utils/response.js';
 
@@ -97,7 +97,8 @@ export function createIdempotencyMiddleware(
         if (res.statusCode >= 200 && res.statusCode < 300) {
           store.set(
             idempotencyKey,
-            { requestFingerprint: incomingHash, statusCode: res.statusCode, body },
+            { version: ENVELOPE_VERSION,
+        requestFingerprint: incomingHash, statusCode: res.statusCode, body },
             ttlSeconds,
           ).catch((err) => {
             logger.error('Failed to store idempotent response', req.correlationId as string, { 

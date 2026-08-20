@@ -138,7 +138,7 @@ export function buildDeploymentChecklistReport(input: {
         ? parityRequired
           ? 'fail'
           : 'not_applicable'
-        : indexerHealth.status === 'healthy' || indexerHealth.dependency === 'healthy'
+        : indexerHealth.status === 'healthy'
           ? 'pass'
           : parityRequired
             ? 'fail'
