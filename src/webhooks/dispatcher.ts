@@ -571,42 +571,19 @@ export async function dispatchWebhook(opts: SimpleWebhookDispatch): Promise<void
   }
 
   // Optional reorg suppression: callers that pass a ledger number opt in to
-  // skipping delivery for ledgers the indexer has rolled back.  The import is
-  // dynamic so this helper has no hard dependency on the indexer module graph.
-  if (opts.ledger !== undefined) {
-    try {
-      const config = getConfig();
-      allowlist = config.webhookAllowedHosts;
-    } catch {
-      // Config not initialized, proceed without allowlist
+  // skipping delivery for ledgers the indexer has rolled back. The imports are
+  // dynamic to avoid hard dependencies on the indexer module graph.
+  if (typeof opts.ledger === 'number') {
+    const [{ webhookDeliveriesSuppressedTotal }, { isLedgerRolledBack }] = await Promise.all([
+      import('../metrics/businessMetrics.js'),
+      import('../indexer/service.js'),
+    ]);
+    if (isLedgerRolledBack(opts.ledger)) {
+      // Increment suppressed counter with outcome label
+      webhookDeliveriesSuppressedTotal.inc({ outcome: 'suppressed' });
+      return;
     }
-    validatedUrl = await validateWebhookTarget(opts.url, {
-      allowlist,
-    });
-  } catch (error) {
-    if (error instanceof WebhookTargetValidationError) {
-      logger.error('Webhook target rejected by SSRF guard', undefined, {
-        reason: error.message,
-      });
-      throw error;
-    }
-    throw error;
   }
-
-    // Optional reorg suppression: callers that pass a ledger number opt in to
-    // skipping delivery for ledgers the indexer has rolled back.
-    // The imports are dynamic to avoid hard dependencies on the indexer module.
-    if (typeof opts.ledger === 'number') {
-      const [{ webhookDeliveriesSuppressedTotal }, { isLedgerRolledBack }] = await Promise.all([
-        import('../metrics/businessMetrics.js'),
-        import('../indexer/service.js'),
-      ]);
-      if (isLedgerRolledBack(opts.ledger)) {
-        // Increment suppressed counter with outcome label
-        webhookDeliveriesSuppressedTotal.inc({ outcome: 'suppressed' });
-        return;
-      }
-    }
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const payloadStr = JSON.stringify(opts.payload);
