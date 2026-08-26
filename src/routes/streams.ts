@@ -691,8 +691,17 @@ streamsRouter.get(
         throw forbidden('Scoped users are not authorized to use the full export endpoint');
       }
 
-      while (true) {
+      const MAX_PAGES = 1000;
+      let pagesFetched = 0;
+
+      while (pagesFetched < MAX_PAGES) {
+        if (req.closed || req.destroyed) {
+          info('Stream export cancelled by client', { requestId });
+          break;
+        }
+
         const dbResult = await streamRepository.findWithCursor({}, limit, cursor?.lastId);
+        pagesFetched++;
 
         for (const record of dbResult.streams) {
           res.write(JSON.stringify(toApiStream(record)) + '\n');
@@ -704,11 +713,12 @@ streamsRouter.get(
         }
 
         if (!dbResult.hasMore) {
-          res.end();
           break;
         }
       }
-      info('Stream export completed', { requestId });
+      
+      res.end();
+      info('Stream export completed or bounded', { requestId, pagesFetched });
     } catch (err) {
       warn('Stream export failed', { requestId, error: err instanceof Error ? err.message : String(err) });
       wrapDbError(err);
