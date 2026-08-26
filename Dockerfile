@@ -3,11 +3,13 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json pnpm-lock.yaml* ./
+# Copy package files and the preinstall guard
+COPY package.json pnpm-lock.yaml ./
+COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
 
-# Install pnpm and dependencies
-RUN npm install -g pnpm && \
+# Activate the pinned pnpm version and install dependencies
+RUN corepack enable && \
+    corepack prepare pnpm@9.15.9 --activate && \
     pnpm install --frozen-lockfile
 
 # Copy source code
@@ -21,14 +23,14 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Install pnpm
-RUN npm install -g pnpm
+# Copy package files and the preinstall guard
+COPY package.json pnpm-lock.yaml ./
+COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
 
-# Copy package files
-COPY package.json pnpm-lock.yaml* ./
-
-# Install production dependencies only
-RUN pnpm install --prod --frozen-lockfile
+# Activate the pinned pnpm version and install production dependencies only
+RUN corepack enable && \
+    corepack prepare pnpm@9.15.9 --activate && \
+    pnpm install --prod --frozen-lockfile
 
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
