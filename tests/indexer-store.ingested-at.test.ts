@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { PostgresContractEventStore } from '../src/indexer/store.js';
+import {
+  InMemoryContractEventStore,
+  PostgresContractEventStore,
+} from '../src/indexer/store.js';
+import { RowMappingError } from '../src/db/rowMapping.js';
 import type { ContractEventRecord } from '../src/indexer/types.js';
 
 function makeRecord(eventId: string, ledger = 100, ingestedAt?: string): ContractEventRecord {
@@ -155,5 +159,44 @@ describe('20260627110000_contract_events_ingested_at_default migration', () => {
       default: null,
       notNull: false,
     });
+  });
+});
+
+describe('InMemoryContractEventStore — ingestedAt is stamped once at insert (#1316)', () => {
+  it('returns the timestamp assigned at insert time, not one minted per read', async () => {
+    const store = new InMemoryContractEventStore();
+    await store.insertMany([makeRecord('e1')]);
+
+    const first = await store.getEvents();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await store.getEvents();
+
+    expect(first.events[0]!.ingestedAt).toBe(second.events[0]!.ingestedAt);
+  });
+
+  it('stamps a valid ISO-8601 timestamp on insert', async () => {
+    const store = new InMemoryContractEventStore();
+    const before = Date.now();
+    await store.insertMany([makeRecord('e1')]);
+
+    const result = await store.getEvents();
+    const stamped = Date.parse(result.events[0]!.ingestedAt);
+
+    expect(Number.isNaN(stamped)).toBe(false);
+    expect(stamped).toBeGreaterThanOrEqual(before);
+  });
+
+  it('reports a record stored without an ingest timestamp instead of inventing one', async () => {
+    const store = new InMemoryContractEventStore();
+    await store.insertMany([makeRecord('e1')]);
+
+    // Simulate a record that bypassed insertMany, which is the only way the
+    // timestamp can be missing. Previously this was silently backfilled with
+    // the current time and returned as if it were the real ingest instant.
+    const stored = (store as unknown as { records: Map<string, ContractEventRecord> }).records;
+    const record = stored.get('e1')!;
+    delete (record as { ingestedAt?: string }).ingestedAt;
+
+    await expect(store.getEvents()).rejects.toThrow(RowMappingError);
   });
 });
