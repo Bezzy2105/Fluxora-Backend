@@ -9,14 +9,14 @@ export class StaleCursorError extends Error {
   public readonly code = STALE_CURSOR_ERROR_CODE;
 
   constructor(public readonly afterEventId: string) {
-    super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedger`);
+    super(`Replay cursor '${afterEventId}' no longer exists; resync from fromLedgerj`);
     this.name = 'StaleCursorError';
   }
 }
 
 /** Record of a chain reorg that evicted previously stored events. */
 export interface ReorgRecord {
-  /** The ledger at which the fork occurred — all events at or above this were evicted. */
+  /** The ledger at which the fork occurred -- all events at or above this were evicted. */
   forkLedger: number;
   /** The ledger hash that was evicted from the store. */
   evictedHash: string;
@@ -33,8 +33,10 @@ export interface ContractEventStore {
   insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult>;
   rollbackBeforeLedger(ledger: number): Promise<void>;
   getLedgerHash(ledger: number): Promise<string | null>;
-  /** Replay stored events with optional filtering. Append-only — never mutates. */
+  /** Replay stored events with optional filtering. Append-only -- never mutates. */
   getEvents(filter?: StreamEventReplayFilter): Promise<StreamEventReplayResult>;
+  /** Highest ledger L such that every ledger <= L is present. Returns null when store is empty. */
+  getContiguousLedger(): Promise<number | null>;
 }
 
 export interface PgClientLike {
@@ -43,8 +45,8 @@ export interface PgClientLike {
 
 export class InMemoryContractEventStore implements ContractEventStore {
   public readonly kind: IndexerStoreKind = 'memory';
-  private readonly records = new Map<string, ContractEventRecord>();
-  private readonly reorgLog: ReorgRecord[] = [];
+  private records = new Map<string, ContractEventRecord>();
+  private reorgLog: ReorgRecord[] = [];
 
   async insertMany(events: ContractEventRecord[]): Promise<InsertContractEventsResult> {
     const insertedEventIds: string[] = [];
@@ -173,11 +175,22 @@ export class InMemoryContractEventStore implements ContractEventStore {
   }
 
   tipLedger(): number | null {
-    let tip: number | null = null;
+    let tip : number | null = null;
     for (const record of this.records.values()) {
       if (tip === null || record.ledger > tip) tip = record.ledger;
     }
     return tip;
+  }
+
+  async getContiguousLedger(): Promise<number | null> {
+    const ledgers = [...new Set([...this.records.values()].map((r) => r.ledger))].sort((a, b) => a - b);
+    if (ledgers.length === 0) return null;
+    let prev = ledgers[0];
+    for (let i = 1; i < ledgers.length; i++) {
+      if (ledgers[i] !== prev + 1) return prev;
+      prev = ledgers[i];
+    }
+    return prev;
   }
 }
 
@@ -224,22 +237,22 @@ export class PostgresContractEventStore implements ContractEventStore {
       const basePlaceholders = [
         `$${placeholderOffset}`,
         `$${placeholderOffset + 1}`,
-        `$${placeholderOffset + 2}`,
-        `$${placeholderOffset + 3}`,
-        `$${placeholderOffset + 4}`,
-        `$${placeholderOffset + 5}`,
-        `$${placeholderOffset + 6}`,
-        `$${placeholderOffset + 7}`,
-        `$${placeholderOffset + 8}::jsonb`,
-        `$${placeholderOffset + 9}::timestamptz`,
-        `$${placeholderOffset + 10}`,
+        `${placeholderOffset + 2}`,
+        `${placeholderOffset + 3}`,
+        `${placeholderOffset + 4}`,
+        `${placeholderOffset + 5}`,
+        `${placeholderOffset + 6}`,
+        `${placeholderOffset + 7}`,
+        `${placeholderOffset + 8}::jsonb,
+        `${placeholderOffset + 9}::timestamptz,
+        `${placeholderOffset + 10}`,
       ];
 
       placeholderOffset += 11;
 
       if (event.ingestedAt !== undefined && event.ingestedAt !== null) {
         values.push(event.ingestedAt);
-        basePlaceholders.push(`$${placeholderOffset}::timestamptz`);
+        basePlaceholders.push(`${placeholderOffset}::timestamptz`);
         placeholderOffset += 1;
       } else {
         basePlaceholders.push('DEFAULT');
@@ -322,56 +335,76 @@ export class PostgresContractEventStore implements ContractEventStore {
       // Fetch the cursor row's ledger so we can use a composite key comparison
       const cursorResult = await this.client.query<{ ledger: number }>(
         `SELECT ledger FROM ${this.tableName} WHERE event_id = $1 LIMIT 1`,
-        [filter.afterEventId],
+        [filter.afterEventId]
       );
-      const cursorRow = cursorResult.rows[0];
-      if (!cursorRow) {
+      if (cursorResult.rows.length === 0) {
         throw new StaleCursorError(filter.afterEventId);
       }
-
-      const cursorLedger = cursorRow.ledger;
+      const cursorLedger = cursorResult.rows[0].ledger;
       values.push(cursorLedger, filter.afterEventId);
-      conditions.push(
-        `(ledger > $${values.length - 1} OR (ledger = $${values.length - 1} AND event_id > $${values.length}))`,
-      );
+      const ledgerParam = `$${values.length - 1}`;
+      const eventIdParam = `$${values.length}`;
+      conditions.push(`(ledger > ${ledgerParam} OR (ledger = ${ledgerParam} AND event_id > ${eventIdParam}))`);
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const countResult = await this.client.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM ${this.tableName} ${where}`,
-      values
-    );
-    const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
+    // Count total matching records (without limit/offset)
+    const countSql = `SELECT COUNT(*)::int AS count FROM ${this.tableName} ${where}`;
+    const countResult = await this.client.query<{ count: number }>(countSql, values);
+    const total = countResult.rows[0]?.count ?? 0;
 
-    const pageValues = [...values, limit, filter.afterEventId !== undefined ? 0 : offset];
-    const dataResult = await this.client.query<{
-      event_id: string; ledger: number; ledger_hash: string; contract_id: string;
-      topic: string; tx_hash: string; tx_index: number; operation_index: number;
-      event_index: number; payload: Record<string, unknown>; happened_at: string;
-      ingested_at: string;
-    }>(
-      `SELECT event_id, ledger, ledger_hash, contract_id, topic, tx_hash,
-              tx_index, operation_index, event_index, payload, happened_at, ingested_at
-       FROM ${this.tableName} ${where}
-       ORDER BY ledger ASC, event_id ASC
-       LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
-      pageValues
-    );
+    // Fetch the page
+    const dataSql = `
+      SELECT
+        event_id AS "eventId",
+        ledger,
+        contract_id AS "contractId",
+        topic,
+        tx_hash AS "txHash",
+        tx_index AS "txIndex",
+        operation_index AS "operationIndex",
+        event_index AS "eventIndex",
+        payload,
+        happened_at AS "happenedAt",
+        ledger_hash AS "ledgerHash",
+        ingested_at AS "ingestedAt"
+      FROM ${this.tableName}
+      ${where}
+      ORDER BY ledger ASC, event_id ASC
+      LIMIT $${values.length + 1} OFFSET $${values.length + 2}
+    `;
+    values.push(limit, offset);
+    const dataResult = await this.client.query<[
+      {
+        eventId: string;
+        ledger: number;
+        contractId: string;
+        topic: string;
+        txHash: string;
+        txIndex: number;
+        operationIndex: number;
+        eventIndex: number;
+        payload: unknown;
+        happenedAt: Date | string;
+        ledgerHash: string;
+        ingestedAt: Date | string | null;
+      }
+    ](dataSql, values);
 
-    const events: StreamEventRecord[] = dataResult.rows.map((row) => ({
-      eventId: row.event_id,
+    const events = dataResult.rows.map((row) => ({
+      eventId: row.eventId,
       ledger: row.ledger,
-      ledgerHash: row.ledger_hash,
-      contractId: row.contract_id,
+      contractId: row.contractId,
       topic: row.topic,
-      txHash: row.tx_hash,
-      txIndex: row.tx_index,
-      operationIndex: row.operation_index,
-      eventIndex: row.event_index,
+      txHash: row.txHash,
+      txIndex: row.txIndex,
+      operationIndex: row.operationIndex,
+      eventIndex: row.eventIndex,
       payload: row.payload,
-      happenedAt: row.happened_at,
-      ingestedAt: row.ingested_at,
+      happenedAt: row.happenedAt instanceof Date ? row.happenedAt.toISOString() : String(row.happenedAt),
+      ledgerHash: row.ledgerHash,
+      ingestedAt: row.ingestedAt ? (row.ingestedAt instanceof Date ? row.ingestedAt.toISOString() : String(row.ingestedAt)) : undefined,
     }));
 
     const lastEvent = events[events.length - 1];
@@ -386,5 +419,19 @@ export class PostgresContractEventStore implements ContractEventStore {
       offset: filter.afterEventId !== undefined ? 0 : offset,
       ...(nextCursor !== undefined ? { nextCursor } : {}),
     };
+  }
+
+  async getContiguousLedger(): Promise<number | null> {
+    const result = await this.client.query<{ ledger: number }>(
+      `SELECT DISTINCT ledger FROM ${this.tableName} ORDER BY ledger ASC`
+    );
+    const ledgers = result.rows.map((r) => r.ledger);
+    if (ledgers.length === 0) return null;
+    let prev = ledgers[0];
+    for (let i = 1; i < ledgers.length; i++) {
+      if (ledgers[i] !== prev + 1) return prev;
+      prev = ledgers[i];
+    }
+    return prev;
   }
 }
