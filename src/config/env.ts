@@ -1128,6 +1128,11 @@ export function reloadHotConfig(): HotConfig {
  *                without killing the process.
  */
 export async function refreshHotConfig(apply?: {
+  /** Two-phase commit style (preferred): return a commit fn from preparation. */
+  prepareRateLimits?: (hot: HotConfig) => () => void;
+  prepareFeatureFlags?: (hot: HotConfig) => () => void;
+  prepareLogLevel?: (level: LogLevel) => () => void;
+  /** Legacy direct-apply style (still supported). */
   applyRateLimits?: (hot: HotConfig) => void;
   applyFeatureFlags?: () => void;
   applyLogLevel?: (level: LogLevel) => void;
@@ -1165,10 +1170,30 @@ export async function refreshHotConfig(apply?: {
       const changed =
         previous === null || hotConfigFingerprint(previous) !== hotConfigFingerprint(hot);
 
-      // Apply side effects in a fixed order for deterministic deploys/retries.
-      apply?.applyRateLimits?.(hot);
-      apply?.applyFeatureFlags?.();
-      apply?.applyLogLevel?.(hot.logLevel);
+      // Resolve prepare callbacks — prefer the prepare* form (two-phase commit);
+      // fall back to the legacy apply* form for backward compatibility.
+      const commitRateLimits = apply?.prepareRateLimits
+        ? apply.prepareRateLimits(hot)
+        : apply?.applyRateLimits
+          ? () => apply.applyRateLimits!(hot)
+          : undefined;
+
+      const commitFeatureFlags = apply?.prepareFeatureFlags
+        ? apply.prepareFeatureFlags(hot)
+        : apply?.applyFeatureFlags
+          ? () => apply.applyFeatureFlags!()
+          : undefined;
+
+      const commitLogLevel = apply?.prepareLogLevel
+        ? apply.prepareLogLevel(hot.logLevel)
+        : apply?.applyLogLevel
+          ? () => apply.applyLogLevel!(hot.logLevel)
+          : undefined;
+
+      // Commit side effects in a fixed order for deterministic deploys/retries.
+      commitRateLimits?.();
+      commitFeatureFlags?.();
+      commitLogLevel?.();
 
       lastHotConfig = hot;
       reloadGeneration += 1;

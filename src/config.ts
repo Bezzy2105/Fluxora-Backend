@@ -12,12 +12,6 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function envBool(name: string, fallback: boolean): boolean {
-  const v = process.env[name];
-  if (!v) return fallback;
-  return /^(true|1|yes|on)$/i.test(v.trim());
-}
-
 export const config = {
   stellar: {
     rpcUrl: process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
@@ -49,28 +43,23 @@ export const config = {
      * committed batches intact so a re-run can resume from the cursor.
      * 0 = no budget (unlimited). Default: 0.
      */
-    replayBudgetMs: envInt('INDEXER_REPLAY_BUGGET_MS', 0),
+    replayBudgetMs: envInt('INDEXER_REPLAY_BUDGET_MS', 0),
 
     /**
-     * Maximum number of batches that can be processed concurrently during a
-     * backfill. Setting this to 1 preserves strict ordering; higher values allow parallelism at the cost of ordering guarantees. Default: 1.
+     * Forced-stop timeout (ms) used to bound a single batch's database wait
+     * once a replay cancellation has been requested. Cooperatively, batches
+     * already abort at the next safe checkpoint (before fetch / before commit);
+     * this timeout guarantees the in-memory indexer lock and leader lease are
+     * released even if a `fetch` or `COMMIT` call hangs on a stuck connection.
+     * 0 = wait indefinitely (no forced timeout). Default: 10_000.
      */
-    backfillConcurrency: envInt('INDEXER_BACKFILL_CONCURRENCY', 1),
+    replayStopForcedTimeoutMs: envInt('INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS', 10_000),
 
-    /**
-     * Number of blocks between checkpoints during a backfill. A checkpoint is
-     * committed only after all batches up to that point have succeeded, ensuring
-     * resumable progress in order. Default: 1.
-     */
-    checkpointIntervalBlocks: envInt('INDEXER_CHECKPOINT_INTERVAL_BLOCKS', 1),
+    /** Maximum concurrent batches in a backfill worker pool. */
+    backfillConcurrency: envInt('INDEXER_BACKFILL_CONCURRENCY', 5),
 
-    /**
-     * If true, checkpoint commits are serialized (ordered). If false, a later
-     * checkpoint may be committed before an earlier one under concurrent
-     * execution. Keep true unless you have a custom coordination layer.
-     * Default: true.
-     */
-    orderedCheckpoints: envBool('INDEXER_ORDERED_CHECKPOINTS', true),
+    /** Maximum attempts for a failed backfill batch. */
+    backfillMaxRetries: envInt('INDEXER_BACKFILL_MAX_RETRIES', 3),
   },
   dlq: {
     /** Retention in days for terminal dead_letter_queue entries. Default 30. */
