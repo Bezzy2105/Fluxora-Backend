@@ -20,7 +20,7 @@ function makeRecord(eventId: string, ledger = 100, ingestedAt?: string): Contrac
 }
 
 describe('PostgresContractEventStore — ingested_at dynamic defaults', () => {
-  it('omits ingested_at from values and binds DEFAULT in SQL placeholder when omitted', async () => {
+  it('uses the database clock when ingested_at is omitted', async () => {
     let capturedSql = '';
     const capturedValues: unknown[] = [];
 
@@ -39,11 +39,11 @@ describe('PostgresContractEventStore — ingested_at dynamic defaults', () => {
 
     // Check SQL column list and placeholders
     expect(capturedSql).toContain('ingested_at');
-    // The placeholder should end with DEFAULT to trigger DB default
-    expect(capturedSql).toContain('DEFAULT)');
-    // Total parameters should be exactly 11 (event_id to ledger_hash)
-    expect(capturedValues).toHaveLength(11);
-    expect(capturedValues[10]).toBe('hash-100'); // Last param is ledgerHash
+    expect(capturedSql).toContain('COALESCE');
+    expect(capturedSql).toContain('now()');
+    expect(capturedValues).toHaveLength(12);
+    expect(capturedValues[10]).toBe('hash-100');
+    expect(capturedValues[11]).toBeNull();
   });
 
   it('binds explicit ingested_at and uses parameter placeholder when provided', async () => {
