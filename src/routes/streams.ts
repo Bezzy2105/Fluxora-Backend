@@ -1715,26 +1715,41 @@ streamsRouter.get(
       const eventStore = hub?.getEventStore();
       if (eventStore) {
         try {
-          const result = await eventStore.getEvents({
-            afterEventId: sinceEventId,
-            limit: 100,
-          });
+          let cursor: string | undefined = sinceEventId;
+          const LONG_POLL_REPLAY_MAX_PAGES = 10;
+          let pagesRead = 0;
+          let foundEvent = false;
 
-          for (const event of result.events) {
+          do {
             if (cleanedUp) break;
-            if (eventMatchesStreamId(event, id)) {
-              const envelope = {
-                type: 'stream_update',
-                streamId: id,
-                eventId: event.eventId,
-                payload: event.payload,
-                correlationId: req.correlationId,
-              };
-              cleanup('replay_event_found');
-              res.json(successResponse(envelope, requestId));
-              return;
+            const result = await eventStore.getEvents({
+              afterEventId: cursor,
+              limit: 100,
+            });
+
+            for (const event of result.events) {
+              if (cleanedUp) break;
+              if (eventMatchesStreamId(event, id)) {
+                const envelope = {
+                  type: 'stream_update',
+                  streamId: id,
+                  eventId: event.eventId,
+                  payload: event.payload,
+                  correlationId: req.correlationId,
+                };
+                cleanup('replay_event_found');
+                res.json(successResponse(envelope, requestId));
+                foundEvent = true;
+                break;
+              }
             }
-          }
+
+            if (foundEvent) break;
+            cursor = result.nextCursor;
+            pagesRead++;
+          } while (cursor !== undefined && !cleanedUp && pagesRead < LONG_POLL_REPLAY_MAX_PAGES);
+
+          if (foundEvent) return;
         } catch (err) {
           if (err instanceof StaleCursorError || (err as any)?.name === 'StaleCursorError') {
             cleanup('stale_cursor');
