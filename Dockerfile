@@ -23,6 +23,10 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# Keep Corepack's prepared pnpm distribution outside root's home so the
+# non-root runtime user can execute pnpm without downloading it again.
+ENV COREPACK_HOME=/opt/corepack
+
 # Copy package files and the preinstall guard
 COPY package.json pnpm-lock.yaml ./
 COPY scripts/check-package-manager.js ./scripts/check-package-manager.js
@@ -40,7 +44,7 @@ RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
 
 # Change ownership
-RUN chown -R nodejs:nodejs /app
+RUN chown -R nodejs:nodejs /app /opt/corepack
 
 # Switch to non-root user
 USER nodejs
