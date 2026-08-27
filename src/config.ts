@@ -44,6 +44,16 @@ export const config = {
      * 0 = no budget (unlimited). Default: 0.
      */
     replayBudgetMs: envInt('INDEXER_REPLAY_BUDGET_MS', 0),
+
+    /**
+     * Forced-stop timeout (ms) used to bound a single batch's database wait
+     * once a replay cancellation has been requested. Cooperatively, batches
+     * already abort at the next safe checkpoint (before fetch / before commit);
+     * this timeout guarantees the in-memory indexer lock and leader lease are
+     * released even if a `fetch` or `COMMIT` call hangs on a stuck connection.
+     * 0 = wait indefinitely (no forced timeout). Default: 10_000.
+     */
+    replayStopForcedTimeoutMs: envInt('INDEXER_REPLAY_STOP_FORCED_TIMEOUT_MS', 10_000),
   },
   dlq: {
     /** Retention in days for terminal dead_letter_queue entries. Default 30. */
