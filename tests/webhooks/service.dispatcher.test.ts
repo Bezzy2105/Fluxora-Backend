@@ -541,4 +541,62 @@ describe('WebhookDispatcher outbox polling', () => {
       expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
     });
   });
+
+  describe('delivery deadlines', () => {
+    it('cancels in-flight webhook requests when delivery deadlines expire', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = createClient([
+          {
+            id: 'timeout-1',
+            stream_id: 'stream-timeout',
+            event_type: 'stream.created',
+            payload: { id: 'evt-timeout' },
+            created_at: new Date(),
+          },
+        ]);
+        
+        let abortSignal: AbortSignal | undefined;
+        global.fetch = vi.fn(async (_url, options) => {
+          abortSignal = options?.signal as AbortSignal;
+          return new Promise<Response>((resolve, reject) => {
+            if (abortSignal) {
+              abortSignal.addEventListener('abort', () => {
+                reject(abortSignal?.reason || new DOMException('Aborted', 'AbortError'));
+              });
+            }
+          });
+        }) as unknown as typeof fetch;
+
+        const dispatcher = createDispatcher(client, breaker);
+        
+        const pollPromise = dispatcher.pollOnce();
+        
+        // Wait for fetch to be called and set up listener
+        await Promise.resolve();
+        await Promise.resolve();
+        
+        await vi.advanceTimersByTimeAsync(1500); // Wait for timeout (policy.timeoutMs = 1000)
+        
+        await pollPromise;
+        
+        expect(global.fetch).toHaveBeenCalledOnce();
+        
+        // Should NOT enqueue retry because timeout is treated as permanent failure ('poison' / 'timeout')
+        expect(client.queries.some((q) => q.sql.includes('INSERT INTO webhook_outbox'))).toBe(false);
+        
+        // Should mark the row as processed
+        expect(client.queries).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              sql: 'UPDATE webhook_outbox SET processed = true WHERE id = $1',
+              params: ['timeout-1'],
+            }),
+          ])
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });
